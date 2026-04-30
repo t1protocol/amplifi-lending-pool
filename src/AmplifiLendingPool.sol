@@ -402,6 +402,5 @@ contract AmplifiLendingPool is ERC20, ReentrancyGuard, Ownable {
         if (_baseRateBps > _kinkRateBps) revert InvalidRateParams();
         if (_kinkRateBps > _maxRateBps) revert InvalidRateParams();
         if (_kinkUtilizationBps == 0 || _kinkUtilizationBps > BPS) revert InvalidRateParams();
-        if (_maxRateBps > BPS) revert InvalidRateParams(); // cap at 100% APR
     }
 }
