@@ -461,6 +461,25 @@ contract AmplifiLendingPoolTest is Test {
         pool.setRateParams(5000, 8000, 3000, 8000);
     }
 
+    function test_setRateParams_acceptsRatesAboveBps() public {
+        // The 100% APR cap was lifted to support higher-risk pools (e.g.
+        // sports). The validator now only enforces baseRate ≤ kinkRate ≤
+        // maxRate and a non-zero / ≤BPS kinkUtilization.
+        vm.prank(owner);
+        pool.setRateParams(2000, 8500, 20000, 100000);
+        assertEq(pool.baseRateBps(), 2000);
+        assertEq(pool.kinkUtilizationBps(), 8500);
+        assertEq(pool.kinkRateBps(), 20000);
+        assertEq(pool.maxRateBps(), 100000);
+    }
+
+    function test_setRateParams_kinkUtilizationStillCappedAtBps() public {
+        // kinkUtilization is a fraction, not a rate — must stay ≤BPS.
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRateParams()"));
+        pool.setRateParams(200, 10001, 2000, 10000);
+    }
+
     function test_setPoolStatus_onlyOwner() public {
         vm.prank(lender1);
         vm.expectRevert();
