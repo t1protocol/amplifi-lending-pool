@@ -426,7 +426,8 @@ contract AmplifiLendingPoolTest is Test {
         vm.stopPrank();
     }
 
-    function test_closed_blocksWithdrawals() public {
+    function test_closed_allowsWithdrawals() public {
+        // Audit #1: Closed must not strand lender funds. Withdraw still works in Closed.
         _depositAs(lender1, 100_000_000);
 
         vm.startPrank(owner);
@@ -436,8 +437,29 @@ contract AmplifiLendingPoolTest is Test {
 
         uint256 lenderShares = pool.balanceOf(lender1);
         vm.prank(lender1);
-        vm.expectRevert(abi.encodeWithSignature("PoolClosed()"));
         pool.withdraw(lenderShares);
+
+        assertEq(usdc.balanceOf(lender1), 100_000_000, "Lender recovers funds in Closed state");
+        assertEq(pool.balanceOf(lender1), 0);
+    }
+
+    function test_closed_allowsRepay() public {
+        // Audit #6: Closed must not strand outstanding loans. Repay still works in Closed.
+        _depositAs(lender1, 100_000_000);
+        _borrow(1, 50_000_000);
+
+        vm.startPrank(owner);
+        pool.setPoolStatus(PoolStatus.WindingDown);
+        pool.setPoolStatus(PoolStatus.Closed);
+        vm.stopPrank();
+
+        vm.prank(borrower);
+        usdc.approve(address(pool), 50_000_000);
+
+        _repay(1);
+
+        assertEq(pool.totalBorrowShares(), 0, "Loan repaid in Closed state");
+        assertEq(pool.loanShares(1), 0);
     }
 
     // ── Access Control ──────────────────────────────────────────────────
@@ -684,7 +706,8 @@ contract AmplifiLendingPoolTest is Test {
         pool.withdrawAssets(20_000_000);
     }
 
-    function test_withdrawAssets_poolClosed_reverts() public {
+    function test_withdrawAssets_closedAllowed() public {
+        // Audit #1: withdrawAssets must also work in Closed state.
         _depositAs(lender1, 100_000_000);
 
         vm.startPrank(owner);
@@ -693,8 +716,8 @@ contract AmplifiLendingPoolTest is Test {
         vm.stopPrank();
 
         vm.prank(lender1);
-        vm.expectRevert(abi.encodeWithSignature("PoolClosed()"));
         pool.withdrawAssets(50_000_000);
+        assertEq(usdc.balanceOf(lender1), 50_000_000);
     }
 
     function test_withdrawAssets_windingDown_works() public {
@@ -931,6 +954,187 @@ contract AmplifiLendingPoolTest is Test {
         // If someone writes off the bad debt (e.g., owner resets state),
         // the share value drops proportionally for all lenders.
         // This is the "lenders absorb bad debt proportionally" property.
+    }
+
+    // ── Audit #2: maxRateBps cap ────────────────────────────────────────
+
+    function test_rateParams_rejectsMaxRateAboveCap() public {
+        // Audit #2: maxRateBps must be capped to block the rate-spike drain path.
+        uint256 capPlusOne = pool.MAX_RATE_CAP_BPS() + 1;
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("InvalidRateParams()"));
+        pool.setRateParams(200, 8500, 2000, capPlusOne);
+    }
+
+    function test_rateParams_acceptsMaxRateAtCap() public {
+        uint256 cap = pool.MAX_RATE_CAP_BPS();
+        vm.prank(owner);
+        pool.setRateParams(200, 8500, 2000, cap);
+        assertEq(pool.maxRateBps(), cap);
+    }
+
+    // ── Audit #3: setFundAccount restriction ────────────────────────────
+
+    function test_setFundAccount_revertsWhenLoansOutstanding() public {
+        _depositAs(lender1, 100_000_000);
+        _borrow(1, 50_000_000);
+
+        address newFund = makeAddr("newFund");
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSignature("LoansOutstanding()"));
+        pool.setFundAccount(newFund);
+    }
+
+    function test_setFundAccount_succeedsWithNoLoans() public {
+        address newFund = makeAddr("newFund");
+        vm.prank(owner);
+        pool.setFundAccount(newFund);
+        assertEq(pool.fundAccount(), newFund);
+    }
+
+    function test_setFundAccount_succeedsAfterFullRepay() public {
+        _depositAs(lender1, 100_000_000);
+        _borrow(1, 50_000_000);
+
+        vm.prank(borrower);
+        usdc.approve(address(pool), 50_000_000);
+        _repay(1);
+
+        address newFund = makeAddr("newFund");
+        vm.prank(owner);
+        pool.setFundAccount(newFund);
+        assertEq(pool.fundAccount(), newFund);
+    }
+
+    // ── Audit #4: Ownable2Step ──────────────────────────────────────────
+
+    function test_ownership_requiresAcceptance() public {
+        address newOwner = makeAddr("newOwner");
+
+        vm.prank(owner);
+        pool.transferOwnership(newOwner);
+
+        // Old owner still owns until newOwner accepts.
+        assertEq(pool.owner(), owner);
+        assertEq(pool.pendingOwner(), newOwner);
+
+        // Old owner can still call onlyOwner functions.
+        vm.prank(owner);
+        pool.setTeeOperator(makeAddr("anotherOp"));
+
+        // newOwner accepts.
+        vm.prank(newOwner);
+        pool.acceptOwnership();
+        assertEq(pool.owner(), newOwner);
+        assertEq(pool.pendingOwner(), address(0));
+
+        // Old owner can no longer call onlyOwner.
+        vm.prank(owner);
+        vm.expectRevert();
+        pool.setTeeOperator(makeAddr("yetAnother"));
+    }
+
+    function test_ownership_acceptByWrongAddress_reverts() public {
+        address newOwner = makeAddr("newOwner");
+        vm.prank(owner);
+        pool.transferOwnership(newOwner);
+
+        vm.prank(lender1); // not the pending owner
+        vm.expectRevert();
+        pool.acceptOwnership();
+    }
+
+    // ── Audit #7: ERC-4626 compliance ───────────────────────────────────
+
+    function test_4626_assetReturnsUsdc() public view {
+        assertEq(pool.asset(), address(usdc));
+    }
+
+    function test_4626_depositToReceiver() public {
+        uint256 amount = 100_000_000;
+        usdc.mint(lender1, amount);
+        vm.startPrank(lender1);
+        usdc.approve(address(pool), amount);
+        uint256 shares = pool.deposit(amount, lender2);
+        vm.stopPrank();
+
+        assertEq(pool.balanceOf(lender2), shares, "Receiver got shares");
+        assertEq(pool.balanceOf(lender1), 0, "Sender got no shares");
+    }
+
+    function test_4626_mintToReceiver() public {
+        // First deposit to establish exchange rate.
+        _depositAs(lender1, 100_000_000);
+
+        uint256 sharesToMint = 50_000_000;
+        uint256 expectedAssets = pool.previewMint(sharesToMint);
+        usdc.mint(lender2, expectedAssets);
+
+        vm.startPrank(lender2);
+        usdc.approve(address(pool), expectedAssets);
+        uint256 assetsPaid = pool.mint(sharesToMint, lender2);
+        vm.stopPrank();
+
+        assertEq(assetsPaid, expectedAssets);
+        assertEq(pool.balanceOf(lender2), sharesToMint);
+    }
+
+    function test_4626_withdrawWithOwner() public {
+        // lender1 deposits, approves lender2 to pull on their behalf.
+        _depositAs(lender1, 100_000_000);
+
+        uint256 sharesNeeded = pool.previewWithdraw(50_000_000);
+        vm.prank(lender1);
+        pool.approve(lender2, sharesNeeded);
+
+        // lender2 calls withdraw, receiver is lender2, owner is lender1.
+        vm.prank(lender2);
+        pool.withdraw(50_000_000, lender2, lender1);
+
+        assertEq(usdc.balanceOf(lender2), 50_000_000, "Receiver got assets");
+        assertEq(pool.allowance(lender1, lender2), 0, "Allowance spent");
+    }
+
+    function test_4626_redeemWithOwner() public {
+        _depositAs(lender1, 100_000_000);
+
+        uint256 sharesToRedeem = 50_000_000;
+        vm.prank(lender1);
+        pool.approve(lender2, sharesToRedeem);
+
+        vm.prank(lender2);
+        uint256 assets = pool.redeem(sharesToRedeem, lender2, lender1);
+
+        assertEq(usdc.balanceOf(lender2), assets);
+        assertEq(pool.balanceOf(lender1), 100_000_000 - sharesToRedeem);
+    }
+
+    function test_4626_redeemWithoutAllowance_reverts() public {
+        _depositAs(lender1, 100_000_000);
+
+        vm.prank(lender2);
+        vm.expectRevert(); // ERC20InsufficientAllowance
+        pool.redeem(50_000_000, lender2, lender1);
+    }
+
+    function test_4626_previewMintRoundsUp() public {
+        _depositAs(lender1, 100_000_000);
+        _borrow(1, 50_000_000);
+        vm.warp(block.timestamp + 180 days);
+
+        uint256 shares = 1_000_003; // odd to force rounding
+        uint256 assetsUp = pool.previewMint(shares);
+        uint256 assetsDown = pool.sharesToAssets(shares);
+
+        assertGe(assetsUp, assetsDown, "previewMint rounds up");
+    }
+
+    function test_4626_maxMintMirrorsMaxDeposit() public {
+        assertEq(pool.maxMint(lender1), pool.maxDeposit(lender1));
+
+        vm.prank(owner);
+        pool.setPoolStatus(PoolStatus.WindingDown);
+        assertEq(pool.maxMint(lender1), 0);
     }
 
     // ── Reentrancy ──────────────────────────────────────────────────────

@@ -3,9 +3,12 @@ pragma solidity ^0.8.24;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 
 enum PoolStatus {
     Active,
@@ -13,7 +16,7 @@ enum PoolStatus {
     Closed
 }
 
-contract AmplifiLendingPool is ERC20, ReentrancyGuard, Ownable {
+contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     using SafeERC20 for IERC20;
 
     // ── Immutables ──────────────────────────────────────────────────────
@@ -28,7 +31,7 @@ contract AmplifiLendingPool is ERC20, ReentrancyGuard, Ownable {
     uint256 public lastAccrualTimestamp;
 
     // ── Loan tracking ─────────────────────────────────────────────────
-    mapping(uint256 => uint256) public loanShares;
+    mapping(uint256 loanId => uint256 shares) public loanShares;
 
     // ── Interest Rate Model ─────────────────────────────────────────────
     uint256 public baseRateBps;
@@ -39,14 +42,17 @@ contract AmplifiLendingPool is ERC20, ReentrancyGuard, Ownable {
     // ── Constants ───────────────────────────────────────────────────────
     uint256 private constant BPS = 10_000;
     uint256 private constant SECONDS_PER_YEAR = 365 days;
+    // Hard ceiling on maxRateBps (10,000% APR). Prevents the rate-spike drain path
+    // where an owner with one share inflates totalBorrowAssets, rounds withdraw share
+    // cost down to 1, and burns 1 share for the whole pool.
+    uint256 public constant MAX_RATE_CAP_BPS = 1_000_000;
     // Virtual offset to mitigate ERC-4626 first-depositor inflation attack.
     // See: https://docs.openzeppelin.com/contracts/5.x/erc4626#defending_with_a_virtual_offset
     uint256 private constant VIRTUAL_SHARES = 1e3;
     uint256 private constant VIRTUAL_ASSETS = 1e3;
 
     // ── Events ──────────────────────────────────────────────────────────
-    event Deposit(address indexed depositor, uint256 assets, uint256 shares);
-    event Withdraw(address indexed withdrawer, uint256 shares, uint256 assets);
+    // Deposit and Withdraw events are inherited from IERC4626 (with sender/owner/receiver).
     event Borrow(uint256 indexed loanId, uint256 amount, uint256 shares);
     event Repay(uint256 indexed loanId, uint256 repaid, uint256 shares);
     event BadDebtRealized(uint256 indexed loanId, uint256 badDebt);
@@ -59,7 +65,6 @@ contract AmplifiLendingPool is ERC20, ReentrancyGuard, Ownable {
     // ── Errors ──────────────────────────────────────────────────────────
     error OnlyTeeOperator();
     error PoolNotActive();
-    error PoolClosed();
     error InsufficientLiquidity();
     error ZeroAmount();
     error ZeroShares();
@@ -68,6 +73,7 @@ contract AmplifiLendingPool is ERC20, ReentrancyGuard, Ownable {
     error ZeroAddress();
     error LoanAlreadyExists();
     error LoanNotFound();
+    error LoansOutstanding();
 
     // ── Modifiers ───────────────────────────────────────────────────────
     modifier onlyTeeOperator() {
@@ -77,11 +83,6 @@ contract AmplifiLendingPool is ERC20, ReentrancyGuard, Ownable {
 
     modifier whenActive() {
         if (status != PoolStatus.Active) revert PoolNotActive();
-        _;
-    }
-
-    modifier whenNotClosed() {
-        if (status == PoolStatus.Closed) revert PoolClosed();
         _;
     }
 
@@ -111,39 +112,134 @@ contract AmplifiLendingPool is ERC20, ReentrancyGuard, Ownable {
         _validateRateParams(_baseRateBps, _kinkUtilizationBps, _kinkRateBps, _maxRateBps);
     }
 
-    // ── ERC20 Overrides ─────────────────────────────────────────────────
-    function decimals() public pure override returns (uint8) {
+    // ── ERC20 / IERC20Metadata Override ─────────────────────────────────
+    function decimals() public pure override(ERC20, IERC20Metadata) returns (uint8) {
         return 6;
     }
 
-    // ── Core Functions ──────────────────────────────────────────────────
+    // ── ERC-4626 ────────────────────────────────────────────────────────
 
-    function deposit(uint256 assets) external nonReentrant whenActive {
+    function asset() external view returns (address) {
+        return address(usdc);
+    }
+
+    // ── Deposits ────────────────────────────────────────────────────────
+
+    /// @notice 1-arg convenience wrapper. Mints shares to msg.sender.
+    function deposit(uint256 assets) external returns (uint256 shares) {
+        return deposit(assets, msg.sender);
+    }
+
+    function deposit(uint256 assets, address receiver) public nonReentrant whenActive returns (uint256 shares) {
         if (assets == 0) revert ZeroAmount();
+        if (receiver == address(0)) revert ZeroAddress();
         accrueInterest();
 
-        uint256 shares = assetsToShares(assets);
+        shares = assetsToShares(assets);
         if (shares == 0) revert ZeroShares();
 
         usdc.safeTransferFrom(msg.sender, address(this), assets);
-        _mint(msg.sender, shares);
+        _mint(receiver, shares);
 
-        emit Deposit(msg.sender, assets, shares);
+        emit Deposit(msg.sender, receiver, assets, shares);
     }
 
-    function withdraw(uint256 shares) external nonReentrant whenNotClosed {
+    function mint(uint256 shares, address receiver) external nonReentrant whenActive returns (uint256 assets) {
+        if (shares == 0) revert ZeroShares();
+        if (receiver == address(0)) revert ZeroAddress();
+        accrueInterest();
+
+        assets = previewMint(shares);
+        if (assets == 0) revert ZeroAmount();
+
+        usdc.safeTransferFrom(msg.sender, address(this), assets);
+        _mint(receiver, shares);
+
+        emit Deposit(msg.sender, receiver, assets, shares);
+    }
+
+    // ── Withdrawals ─────────────────────────────────────────────────────
+    // Withdraw / redeem / repay are NOT gated by PoolStatus.Closed. Gating them
+    // would let a careless or malicious setPoolStatus(Closed) permanently strand
+    // lender funds and outstanding loans (audit #1, #6).
+
+    /// @notice 1-arg convenience wrapper. Burns shares from msg.sender, sends assets to msg.sender.
+    function withdraw(uint256 shares) external nonReentrant returns (uint256 assets) {
         if (shares == 0) revert ZeroShares();
         accrueInterest();
 
-        uint256 assets = sharesToAssets(shares);
+        assets = sharesToAssets(shares);
         if (assets == 0) revert ZeroAmount();
         if (assets > availableLiquidity()) revert InsufficientLiquidity();
 
         _burn(msg.sender, shares);
         usdc.safeTransfer(msg.sender, assets);
 
-        emit Withdraw(msg.sender, shares, assets);
+        emit Withdraw(msg.sender, msg.sender, msg.sender, assets, shares);
     }
+
+    function withdraw(uint256 assets, address receiver, address _owner)
+        external
+        nonReentrant
+        returns (uint256 shares)
+    {
+        if (assets == 0) revert ZeroAmount();
+        if (receiver == address(0)) revert ZeroAddress();
+        accrueInterest();
+
+        if (assets > availableLiquidity()) revert InsufficientLiquidity();
+
+        shares = previewWithdraw(assets);
+        if (shares == 0) revert ZeroShares();
+
+        if (_owner != msg.sender) {
+            _spendAllowance(_owner, msg.sender, shares);
+        }
+        _burn(_owner, shares);
+        usdc.safeTransfer(receiver, assets);
+
+        emit Withdraw(msg.sender, receiver, _owner, assets, shares);
+    }
+
+    function redeem(uint256 shares, address receiver, address _owner)
+        external
+        nonReentrant
+        returns (uint256 assets)
+    {
+        if (shares == 0) revert ZeroShares();
+        if (receiver == address(0)) revert ZeroAddress();
+        accrueInterest();
+
+        assets = sharesToAssets(shares);
+        if (assets == 0) revert ZeroAmount();
+        if (assets > availableLiquidity()) revert InsufficientLiquidity();
+
+        if (_owner != msg.sender) {
+            _spendAllowance(_owner, msg.sender, shares);
+        }
+        _burn(_owner, shares);
+        usdc.safeTransfer(receiver, assets);
+
+        emit Withdraw(msg.sender, receiver, _owner, assets, shares);
+    }
+
+    /// @notice Backward-compat. Takes assets, burns shares from msg.sender, sends to msg.sender.
+    function withdrawAssets(uint256 assets) external nonReentrant returns (uint256 shares) {
+        if (assets == 0) revert ZeroAmount();
+        accrueInterest();
+
+        if (assets > availableLiquidity()) revert InsufficientLiquidity();
+
+        shares = previewWithdraw(assets);
+        if (shares == 0) revert ZeroShares();
+
+        _burn(msg.sender, shares);
+        usdc.safeTransfer(msg.sender, assets);
+
+        emit Withdraw(msg.sender, msg.sender, msg.sender, assets, shares);
+    }
+
+    // ── Borrow / Repay ──────────────────────────────────────────────────
 
     function borrow(uint256 loanId, uint256 amount) external nonReentrant onlyTeeOperator whenActive {
         if (amount == 0) revert ZeroAmount();
@@ -168,8 +264,8 @@ contract AmplifiLendingPool is ERC20, ReentrancyGuard, Ownable {
     ///      When maxRepay >= debt, behaves as a normal full repay (no bad debt).
     ///      When maxRepay < debt (e.g., interest drift exceeded user equity during
     ///      bridging), the shortfall reduces totalBorrowAssets without corresponding
-    ///      USDC inflow — lenders absorb the loss proportionally via reduced share price.
-    function repay(uint256 loanId, uint256 maxRepay) external nonReentrant onlyTeeOperator whenNotClosed {
+    ///      USDC inflow. Lenders absorb the loss proportionally via reduced share price.
+    function repay(uint256 loanId, uint256 maxRepay) external nonReentrant onlyTeeOperator {
         uint256 shares = loanShares[loanId];
         if (shares == 0) revert LoanNotFound();
 
@@ -257,25 +353,13 @@ contract AmplifiLendingPool is ERC20, ReentrancyGuard, Ownable {
         return (assets * (totalSupply() + VIRTUAL_SHARES)) / (totalAssets() + VIRTUAL_ASSETS);
     }
 
-    function withdrawAssets(uint256 assets) external nonReentrant whenNotClosed {
-        if (assets == 0) revert ZeroAmount();
-        accrueInterest();
-
-        if (assets > availableLiquidity()) revert InsufficientLiquidity();
-
-        // Round UP: user burns more shares (favors pool)
-        uint256 shares = previewWithdraw(assets);
-        if (shares == 0) revert ZeroShares();
-
-        _burn(msg.sender, shares);
-        usdc.safeTransfer(msg.sender, assets);
-
-        emit Withdraw(msg.sender, shares, assets);
-    }
-
     // ── ERC-4626 View Functions ──────────────────────────────────────────
 
     function maxDeposit(address) external view returns (uint256) {
+        return status == PoolStatus.Active ? type(uint256).max : 0;
+    }
+
+    function maxMint(address) external view returns (uint256) {
         return status == PoolStatus.Active ? type(uint256).max : 0;
     }
 
@@ -295,9 +379,16 @@ contract AmplifiLendingPool is ERC20, ReentrancyGuard, Ownable {
         return assetsToShares(assets);
     }
 
+    function previewMint(uint256 shares) public view returns (uint256) {
+        // Round UP (favors pool): assets = ceil(shares * (totalAssets + VA) / (totalSupply + VS))
+        uint256 supplyAndVirtual = totalSupply() + VIRTUAL_SHARES;
+        return (shares * (totalAssets() + VIRTUAL_ASSETS) + supplyAndVirtual - 1) / supplyAndVirtual;
+    }
+
     function previewWithdraw(uint256 assets) public view returns (uint256) {
         // Round UP (favors pool)
-        return (assets * (totalSupply() + VIRTUAL_SHARES) + totalAssets() + VIRTUAL_ASSETS - 1) / (totalAssets() + VIRTUAL_ASSETS);
+        uint256 totalAndVirtual = totalAssets() + VIRTUAL_ASSETS;
+        return (assets * (totalSupply() + VIRTUAL_SHARES) + totalAndVirtual - 1) / totalAndVirtual;
     }
 
     function previewRedeem(uint256 shares) external view returns (uint256) {
@@ -322,6 +413,9 @@ contract AmplifiLendingPool is ERC20, ReentrancyGuard, Ownable {
 
     function setFundAccount(address _fundAccount) external onlyOwner {
         if (_fundAccount == address(0)) revert ZeroAddress();
+        // Changing fundAccount while loans are outstanding breaks repay (which pulls
+        // USDC from fundAccount via allowance set against the original address).
+        if (totalBorrowShares > 0) revert LoansOutstanding();
         emit FundAccountUpdated(fundAccount, _fundAccount);
         fundAccount = _fundAccount;
     }
@@ -401,6 +495,7 @@ contract AmplifiLendingPool is ERC20, ReentrancyGuard, Ownable {
     ) internal pure {
         if (_baseRateBps > _kinkRateBps) revert InvalidRateParams();
         if (_kinkRateBps > _maxRateBps) revert InvalidRateParams();
+        if (_maxRateBps > MAX_RATE_CAP_BPS) revert InvalidRateParams();
         if (_kinkUtilizationBps == 0 || _kinkUtilizationBps > BPS) revert InvalidRateParams();
     }
 }
