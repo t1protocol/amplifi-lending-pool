@@ -156,7 +156,11 @@ contract AmplifiLendingPoolForkTest is Test {
 
         vm.warp(block.timestamp + 365 days);
 
-        // fundAccount only has principal, not interest. TEE writes off the shortfall.
+        // fundAccount is a real on-chain address that may already hold pUSD on the fork.
+        // Reset it to exactly the borrow principal so the partial-repay path is exercised
+        // deterministically — without this, pre-existing balance could cover interest
+        // and the test would full-repay instead of realizing bad debt.
+        deal(PUSD, fundAccount, 30_000 * 1e6);
         uint256 fundBalance = pusd.balanceOf(fundAccount);
         vm.prank(fundAccount);
         pusd.approve(address(pool), fundBalance);
