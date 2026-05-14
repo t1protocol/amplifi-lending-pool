@@ -96,7 +96,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         uint256 _kinkUtilizationBps,
         uint256 _kinkRateBps,
         uint256 _maxRateBps
-    ) ERC20("Amplifi Lending Share", "aUSDC") Ownable(_owner) {
+    ) ERC20("Amplifi pUSD Lending Share", "apUSD") Ownable(_owner) {
         if (_usdc == address(0)) revert ZeroAddress();
         if (_teeOperator == address(0)) revert ZeroAddress();
         if (_fundAccount == address(0)) revert ZeroAddress();
