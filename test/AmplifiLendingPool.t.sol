@@ -563,8 +563,8 @@ contract AmplifiLendingPoolTest is Test {
     // ── ERC20 Properties ────────────────────────────────────────────────
 
     function test_shareToken_properties() public view {
-        assertEq(pool.name(), "Amplifi Lending Share");
-        assertEq(pool.symbol(), "aUSDC");
+        assertEq(pool.name(), "Amplifi pUSD Lending Share");
+        assertEq(pool.symbol(), "apUSD");
         assertEq(pool.decimals(), 6);
     }
 

@@ -2,3 +2,7 @@
 /out/
 /cache/
 /broadcast/
+
+# Local secrets
+.env
+.env.local
