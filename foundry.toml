@@ -14,3 +14,4 @@ bracket_spacing = false
 [rpc_endpoints]
 arbitrum = "${ARBITRUM_RPC_URL}"
 arbitrum_sepolia = "${ARBITRUM_SEPOLIA_RPC_URL}"
+polygon = "${POLYGON_RPC_URL}"
