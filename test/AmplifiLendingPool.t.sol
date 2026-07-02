@@ -236,6 +236,9 @@ contract AmplifiLendingPoolTest is Test {
         _depositAs(lender1, 100_000_000);
         address walletA = makeAddr("walletA");
 
+        // First borrow is 1:1, so shares == amount. Event must carry the loan wallet.
+        vm.expectEmit(true, true, false, true, address(pool));
+        emit AmplifiLendingPool.Borrow(1, walletA, 40_000_000, 40_000_000);
         _borrow(1, 40_000_000, walletA);
 
         assertEq(usdc.balanceOf(walletA), 40_000_000, "principal sent directly to the loan wallet");
@@ -258,6 +261,9 @@ contract AmplifiLendingPoolTest is Test {
         uint256 walletBBefore = usdc.balanceOf(walletB);
 
         // Repaying loan 1 pulls ONLY from walletA; walletB (loan 2) is untouched.
+        // Event must attribute the repayment to walletA (repaid == debt == 40M, shares == 40M).
+        vm.expectEmit(true, true, false, true, address(pool));
+        emit AmplifiLendingPool.Repay(1, walletA, 40_000_000, 40_000_000);
         _repay(1);
 
         assertEq(usdc.balanceOf(walletA), 0, "walletA drained to repay its own loan");
