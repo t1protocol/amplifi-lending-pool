@@ -24,7 +24,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     // ── State ───────────────────────────────────────────────────────────
     address public teeOperator;
-    address public fundAccount;
     PoolStatus public status;
     uint256 public totalBorrowAssets;
     uint256 public totalBorrowShares;
@@ -32,6 +31,11 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     // ── Loan tracking ─────────────────────────────────────────────────
     mapping(uint256 loanId => uint256 shares) public loanShares;
+    // Per-loan borrower wallet. borrow() disburses the principal here and repay()
+    // pulls the repayment from here (via allowance). Replaces the single global
+    // fundAccount so funds flow pool<->deposit-wallet directly — no commingling,
+    // and each loan's borrower is recorded on-chain.
+    mapping(uint256 loanId => address wallet) public loanWallet;
 
     // ── Interest Rate Model ─────────────────────────────────────────────
     uint256 public baseRateBps;
@@ -53,10 +57,9 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     // ── Events ──────────────────────────────────────────────────────────
     // Deposit and Withdraw events are inherited from IERC4626 (with sender/owner/receiver).
-    event Borrow(uint256 indexed loanId, uint256 amount, uint256 shares);
-    event Repay(uint256 indexed loanId, uint256 repaid, uint256 shares);
+    event Borrow(uint256 indexed loanId, address indexed wallet, uint256 amount, uint256 shares);
+    event Repay(uint256 indexed loanId, address indexed wallet, uint256 repaid, uint256 shares);
     event BadDebtRealized(uint256 indexed loanId, uint256 badDebt);
-    event FundAccountUpdated(address indexed oldAccount, address indexed newAccount);
     event InterestAccrued(uint256 interest, uint256 newTotalBorrowAssets);
     event TeeOperatorUpdated(address indexed oldOperator, address indexed newOperator);
     event RateParamsUpdated(uint256 baseRateBps, uint256 kinkUtilizationBps, uint256 kinkRateBps, uint256 maxRateBps);
@@ -73,7 +76,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     error ZeroAddress();
     error LoanAlreadyExists();
     error LoanNotFound();
-    error LoansOutstanding();
 
     // ── Modifiers ───────────────────────────────────────────────────────
     modifier onlyTeeOperator() {
@@ -91,7 +93,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         address _usdc,
         address _owner,
         address _teeOperator,
-        address _fundAccount,
         uint256 _baseRateBps,
         uint256 _kinkUtilizationBps,
         uint256 _kinkRateBps,
@@ -99,10 +100,8 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     ) ERC20("Amplifi pUSD Lending Share", "apUSD") Ownable(_owner) {
         if (_usdc == address(0)) revert ZeroAddress();
         if (_teeOperator == address(0)) revert ZeroAddress();
-        if (_fundAccount == address(0)) revert ZeroAddress();
         usdc = IERC20(_usdc);
         teeOperator = _teeOperator;
-        fundAccount = _fundAccount;
         baseRateBps = _baseRateBps;
         kinkUtilizationBps = _kinkUtilizationBps;
         kinkRateBps = _kinkRateBps;
@@ -241,8 +240,13 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     // ── Borrow / Repay ──────────────────────────────────────────────────
 
-    function borrow(uint256 loanId, uint256 amount) external nonReentrant onlyTeeOperator whenActive {
+    /// @notice Open a loan, disbursing the principal directly to `wallet` (the
+    ///         borrower's deposit wallet). Repayment is later pulled from the same
+    ///         wallet by repay(). Caller (teeOperator) is trusted to pass the
+    ///         wallet that posted collateral for this loan.
+    function borrow(uint256 loanId, uint256 amount, address wallet) external nonReentrant onlyTeeOperator whenActive {
         if (amount == 0) revert ZeroAmount();
+        if (wallet == address(0)) revert ZeroAddress();
         if (loanShares[loanId] != 0) revert LoanAlreadyExists();
 
         accrueInterest();
@@ -251,39 +255,46 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
         uint256 shares = _borrowSharesToMint(amount);
         loanShares[loanId] = shares;
+        loanWallet[loanId] = wallet;
         totalBorrowShares += shares;
         totalBorrowAssets += amount;
 
-        usdc.safeTransfer(fundAccount, amount);
+        usdc.safeTransfer(wallet, amount);
 
-        emit Borrow(loanId, amount, shares);
+        emit Borrow(loanId, wallet, amount, shares);
     }
 
-    /// @notice Repay a loan, writing off any shortfall as bad debt absorbed by lenders.
+    /// @notice Repay a loan, pulling the repayment from the loan's borrower wallet
+    ///         (set at borrow) via allowance, and writing off any shortfall as bad
+    ///         debt absorbed by lenders.
     /// @dev Handles both full repayment and partial repayment in a single function.
     ///      When maxRepay >= debt, behaves as a normal full repay (no bad debt).
-    ///      When maxRepay < debt (e.g., interest drift exceeded user equity during
-    ///      bridging), the shortfall reduces totalBorrowAssets without corresponding
-    ///      USDC inflow. Lenders absorb the loss proportionally via reduced share price.
+    ///      When maxRepay < debt (e.g., interest drift exceeded user equity, or the
+    ///      wallet holds less than the debt), the shortfall reduces totalBorrowAssets
+    ///      without corresponding USDC inflow. Lenders absorb the loss proportionally
+    ///      via reduced share price. The wallet must have approved this pool for at
+    ///      least `repaid` pUSD, and hold that balance, or the transferFrom reverts.
     function repay(uint256 loanId, uint256 maxRepay) external nonReentrant onlyTeeOperator {
         uint256 shares = loanShares[loanId];
         if (shares == 0) revert LoanNotFound();
 
         accrueInterest();
 
+        address wallet = loanWallet[loanId];
         uint256 debt = _borrowAssetsOwed(shares);
         uint256 repaid = debt < maxRepay ? debt : maxRepay;
         uint256 badDebt = debt - repaid;
 
         delete loanShares[loanId];
+        delete loanWallet[loanId];
         totalBorrowShares -= shares;
         totalBorrowAssets -= debt;
 
         if (repaid > 0) {
-            usdc.safeTransferFrom(fundAccount, address(this), repaid);
+            usdc.safeTransferFrom(wallet, address(this), repaid);
         }
 
-        emit Repay(loanId, repaid, shares);
+        emit Repay(loanId, wallet, repaid, shares);
         if (badDebt > 0) {
             emit BadDebtRealized(loanId, badDebt);
         }
@@ -409,15 +420,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         if (_teeOperator == address(0)) revert ZeroAddress();
         emit TeeOperatorUpdated(teeOperator, _teeOperator);
         teeOperator = _teeOperator;
-    }
-
-    function setFundAccount(address _fundAccount) external onlyOwner {
-        if (_fundAccount == address(0)) revert ZeroAddress();
-        // Changing fundAccount while loans are outstanding breaks repay (which pulls
-        // USDC from fundAccount via allowance set against the original address).
-        if (totalBorrowShares > 0) revert LoansOutstanding();
-        emit FundAccountUpdated(fundAccount, _fundAccount);
-        fundAccount = _fundAccount;
     }
 
     function setRateParams(

@@ -8,7 +8,6 @@ contract Deploy is Script {
     // Polygon mainnet defaults
     address constant DEFAULT_UNDERLYING = 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB; // pUSD
     address constant DEFAULT_TEE_OPERATOR = 0xAA270BeAC402474A3eDF164C51CdAD9597f01707;
-    address constant DEFAULT_FUND_ACCOUNT = 0xAA270BeAC402474A3eDF164C51CdAD9597f01707;
 
     // Standardized rate model: 20% base / 200% kink / 1000% max at 85% utilization.
     uint256 constant DEFAULT_BASE_RATE_BPS = 2_000;
@@ -20,7 +19,6 @@ contract Deploy is Script {
         address underlying = vm.envOr("UNDERLYING_ADDRESS", DEFAULT_UNDERLYING);
         address owner = vm.envAddress("OWNER_ADDRESS");
         address teeOperator = vm.envOr("TEE_OPERATOR_ADDRESS", DEFAULT_TEE_OPERATOR);
-        address fundAccount = vm.envOr("FUND_ACCOUNT_ADDRESS", DEFAULT_FUND_ACCOUNT);
 
         uint256 baseRateBps = vm.envOr("BASE_RATE_BPS", DEFAULT_BASE_RATE_BPS);
         uint256 kinkUtilizationBps = vm.envOr("KINK_UTILIZATION_BPS", DEFAULT_KINK_UTILIZATION_BPS);
@@ -31,7 +29,6 @@ contract Deploy is Script {
         console2.log("Underlying:        ", underlying);
         console2.log("Owner:             ", owner);
         console2.log("TEE operator:      ", teeOperator);
-        console2.log("Fund account:      ", fundAccount);
         console2.log("Base rate bps:     ", baseRateBps);
         console2.log("Kink util bps:     ", kinkUtilizationBps);
         console2.log("Kink rate bps:     ", kinkRateBps);
@@ -39,7 +36,7 @@ contract Deploy is Script {
 
         vm.startBroadcast();
         AmplifiLendingPool pool = new AmplifiLendingPool(
-            underlying, owner, teeOperator, fundAccount, baseRateBps, kinkUtilizationBps, kinkRateBps, maxRateBps
+            underlying, owner, teeOperator, baseRateBps, kinkUtilizationBps, kinkRateBps, maxRateBps
         );
         vm.stopBroadcast();
 
