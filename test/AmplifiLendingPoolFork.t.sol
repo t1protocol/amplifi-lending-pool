@@ -30,7 +30,7 @@ contract AmplifiLendingPoolForkTest is Test {
     IERC20 pusd;
     address owner;
     address teeOperator;
-    address fundAccount;
+    address borrowerWallet;
     address lender1;
     address lender2;
 
@@ -62,11 +62,11 @@ contract AmplifiLendingPoolForkTest is Test {
 
         owner = makeAddr("owner");
         teeOperator = OPERATOR_FUND;
-        fundAccount = OPERATOR_FUND;
+        borrowerWallet = OPERATOR_FUND;
         lender1 = makeAddr("lender1");
         lender2 = makeAddr("lender2");
 
-        pool = new AmplifiLendingPool(PUSD, owner, teeOperator, fundAccount, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE);
+        pool = new AmplifiLendingPool(PUSD, owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE);
 
         deal(PUSD, lender1, 100_000 * 1e6);
         deal(PUSD, lender2, 100_000 * 1e6);
@@ -114,12 +114,12 @@ contract AmplifiLendingPoolForkTest is Test {
 
         // TEE borrows
         uint256 borrowAmount = 30_000 * 1e6;
-        uint256 fundBalanceBefore = pusd.balanceOf(fundAccount);
+        uint256 fundBalanceBefore = pusd.balanceOf(borrowerWallet);
 
         vm.prank(teeOperator);
-        pool.borrow(1, borrowAmount);
+        pool.borrow(1, borrowAmount, borrowerWallet);
 
-        assertEq(pusd.balanceOf(fundAccount), fundBalanceBefore + borrowAmount, "fund account got the loan");
+        assertEq(pusd.balanceOf(borrowerWallet), fundBalanceBefore + borrowAmount, "borrower wallet got the loan");
 
         // 90 days pass
         vm.warp(block.timestamp + 90 days);
@@ -127,8 +127,8 @@ contract AmplifiLendingPoolForkTest is Test {
         // Full repay
         uint256 debt = pool.loanDebt(1);
         assertGt(debt, borrowAmount, "interest accrued");
-        deal(PUSD, fundAccount, debt);
-        vm.prank(fundAccount);
+        deal(PUSD, borrowerWallet, debt);
+        vm.prank(borrowerWallet);
         pusd.approve(address(pool), debt);
 
         vm.prank(teeOperator);
@@ -152,17 +152,17 @@ contract AmplifiLendingPoolForkTest is Test {
         vm.stopPrank();
 
         vm.prank(teeOperator);
-        pool.borrow(1, 30_000 * 1e6);
+        pool.borrow(1, 30_000 * 1e6, borrowerWallet);
 
         vm.warp(block.timestamp + 365 days);
 
-        // fundAccount is a real on-chain address that may already hold pUSD on the fork.
+        // borrowerWallet is a real on-chain address that may already hold pUSD on the fork.
         // Reset it to exactly the borrow principal so the partial-repay path is exercised
         // deterministically — without this, pre-existing balance could cover interest
         // and the test would full-repay instead of realizing bad debt.
-        deal(PUSD, fundAccount, 30_000 * 1e6);
-        uint256 fundBalance = pusd.balanceOf(fundAccount);
-        vm.prank(fundAccount);
+        deal(PUSD, borrowerWallet, 30_000 * 1e6);
+        uint256 fundBalance = pusd.balanceOf(borrowerWallet);
+        vm.prank(borrowerWallet);
         pusd.approve(address(pool), fundBalance);
 
         uint256 lenderValueBefore = pool.sharesToAssets(pool.balanceOf(lender1));

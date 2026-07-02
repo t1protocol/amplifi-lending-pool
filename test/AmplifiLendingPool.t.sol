@@ -35,7 +35,7 @@ contract AmplifiLendingPoolTest is Test {
     function setUp() public {
         usdc = new MockUSDC();
         pool = new AmplifiLendingPool(
-            address(usdc), owner, teeOperator, borrower, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE
+            address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE
         );
     }
 
@@ -50,8 +50,12 @@ contract AmplifiLendingPoolTest is Test {
     }
 
     function _borrow(uint256 loanId, uint256 amount) internal {
+        _borrow(loanId, amount, borrower);
+    }
+
+    function _borrow(uint256 loanId, uint256 amount, address wallet) internal {
         vm.prank(teeOperator);
-        pool.borrow(loanId, amount);
+        pool.borrow(loanId, amount, wallet);
     }
 
     function _repay(uint256 loanId) internal {
@@ -148,7 +152,7 @@ contract AmplifiLendingPoolTest is Test {
 
         vm.prank(lender1); // not teeOperator
         vm.expectRevert(abi.encodeWithSignature("OnlyTeeOperator()"));
-        pool.borrow(1, 50_000_000);
+        pool.borrow(1, 50_000_000, borrower);
     }
 
     function test_borrow_insufficientLiquidity_reverts() public {
@@ -156,7 +160,7 @@ contract AmplifiLendingPoolTest is Test {
 
         vm.prank(teeOperator);
         vm.expectRevert(abi.encodeWithSignature("InsufficientLiquidity()"));
-        pool.borrow(1, 200_000_000);
+        pool.borrow(1, 200_000_000, borrower);
     }
 
     function test_borrow_duplicateLoanId_reverts() public {
@@ -166,7 +170,7 @@ contract AmplifiLendingPoolTest is Test {
 
         vm.prank(teeOperator);
         vm.expectRevert(abi.encodeWithSignature("LoanAlreadyExists()"));
-        pool.borrow(1, 10_000_000);
+        pool.borrow(1, 10_000_000, borrower);
     }
 
     function test_repay_fullLoan() public {
@@ -176,12 +180,12 @@ contract AmplifiLendingPoolTest is Test {
         uint256 borrowAmount = 50_000_000;
         _borrow(1, borrowAmount);
 
-        // Fund account (borrower) already has the USDC from borrow.
+        // The borrower wallet already has the USDC from borrow.
         // Approve pool to pull it back.
         vm.prank(borrower);
         usdc.approve(address(pool), borrowAmount);
 
-        // TEE operator calls repay — pool pulls from fundAccount
+        // TEE operator calls repay — pool pulls from the loan's wallet
         _repay(1);
 
         assertEq(pool.totalBorrowed(), 0, "totalBorrowed should be 0 after full repay");
@@ -217,6 +221,71 @@ contract AmplifiLendingPoolTest is Test {
 
         assertEq(pool.totalBorrowShares(), 0, "All shares burned");
         assertEq(pool.totalBorrowed(), 0, "totalBorrowed should be 0");
+    }
+
+    // ── Per-loan wallet routing (borrow recipient + repay source) ───────
+
+    function test_borrow_zeroWallet_reverts() public {
+        _depositAs(lender1, 100_000_000);
+        vm.prank(teeOperator);
+        vm.expectRevert(abi.encodeWithSignature("ZeroAddress()"));
+        pool.borrow(1, 50_000_000, address(0));
+    }
+
+    function test_borrow_disbursesToLoanWallet_andRecords() public {
+        _depositAs(lender1, 100_000_000);
+        address walletA = makeAddr("walletA");
+
+        // First borrow is 1:1, so shares == amount. Event must carry the loan wallet.
+        vm.expectEmit(true, true, false, true, address(pool));
+        emit AmplifiLendingPool.Borrow(1, walletA, 40_000_000, 40_000_000);
+        _borrow(1, 40_000_000, walletA);
+
+        assertEq(usdc.balanceOf(walletA), 40_000_000, "principal sent directly to the loan wallet");
+        assertEq(pool.loanWallet(1), walletA, "loan wallet recorded on-chain");
+    }
+
+    function test_repay_pullsFromLoanWallet_perLoanIsolation() public {
+        _depositAs(lender1, 200_000_000);
+        address walletA = makeAddr("walletA");
+        address walletB = makeAddr("walletB");
+
+        _borrow(1, 40_000_000, walletA);
+        _borrow(2, 30_000_000, walletB);
+
+        vm.prank(walletA);
+        usdc.approve(address(pool), type(uint256).max);
+        vm.prank(walletB);
+        usdc.approve(address(pool), type(uint256).max);
+
+        uint256 walletBBefore = usdc.balanceOf(walletB);
+
+        // Repaying loan 1 pulls ONLY from walletA; walletB (loan 2) is untouched.
+        // Event must attribute the repayment to walletA (repaid == debt == 40M, shares == 40M).
+        vm.expectEmit(true, true, false, true, address(pool));
+        emit AmplifiLendingPool.Repay(1, walletA, 40_000_000, 40_000_000);
+        _repay(1);
+
+        assertEq(usdc.balanceOf(walletA), 0, "walletA drained to repay its own loan");
+        assertEq(usdc.balanceOf(walletB), walletBBefore, "walletB untouched by loan 1 repay");
+        assertEq(pool.loanWallet(1), address(0), "loan wallet cleared on repay");
+        assertEq(pool.loanShares(1), 0, "loan 1 closed");
+        assertGt(pool.loanShares(2), 0, "loan 2 still open");
+    }
+
+    function test_repay_walletMissingApproval_reverts() public {
+        _depositAs(lender1, 100_000_000);
+        address walletA = makeAddr("walletA");
+        _borrow(1, 50_000_000, walletA);
+
+        // walletA holds the funds but never approved the pool → transferFrom reverts,
+        // leaving the loan untouched (operator can retry after the approval lands).
+        vm.prank(teeOperator);
+        vm.expectRevert();
+        pool.repay(1, type(uint256).max);
+
+        assertGt(pool.loanShares(1), 0, "loan untouched when repay reverts");
+        assertEq(pool.loanWallet(1), walletA, "loan wallet retained when repay reverts");
     }
 
     // ── Share Math ──────────────────────────────────────────────────────
@@ -398,7 +467,7 @@ contract AmplifiLendingPoolTest is Test {
 
         vm.prank(teeOperator);
         vm.expectRevert(abi.encodeWithSignature("PoolNotActive()"));
-        pool.borrow(1, 50_000_000);
+        pool.borrow(1, 50_000_000, borrower);
     }
 
     function test_windingDown_allowsWithdrawals() public {
@@ -751,10 +820,10 @@ contract AmplifiLendingPoolTest is Test {
         assertGe(assetsFromBurned, assets - 1, "Burned shares should cover requested assets");
     }
 
-    // ── Repay: fundAccount balance scenarios ───────────────────────────
+    // ── Repay: borrower-wallet balance scenarios ───────────────────────
 
-    function test_repay_fundAccountHasExactDebt_succeeds() public {
-        // Simulates normal case: fundAccount has exactly enough for debt.
+    function test_repay_walletHasExactDebt_succeeds() public {
+        // Simulates normal case: the borrower wallet has exactly enough for debt.
         _depositAs(lender1, 100_000_000);
         _borrow(1, 50_000_000);
 
@@ -778,8 +847,8 @@ contract AmplifiLendingPoolTest is Test {
         assertEq(pool.loanShares(1), 0);
     }
 
-    function test_repay_fundAccountInsufficientBalance_reverts() public {
-        // Simulates bad debt scenario: fundAccount doesn't have enough USDC
+    function test_repay_walletInsufficientBalance_reverts() public {
+        // Simulates bad debt scenario: the borrower wallet doesn't have enough USDC
         // to cover the full debt. safeTransferFrom reverts.
         _depositAs(lender1, 100_000_000);
         _borrow(1, 50_000_000);
@@ -971,39 +1040,6 @@ contract AmplifiLendingPoolTest is Test {
         vm.prank(owner);
         pool.setRateParams(200, 8500, 2000, cap);
         assertEq(pool.maxRateBps(), cap);
-    }
-
-    // ── Audit #3: setFundAccount restriction ────────────────────────────
-
-    function test_setFundAccount_revertsWhenLoansOutstanding() public {
-        _depositAs(lender1, 100_000_000);
-        _borrow(1, 50_000_000);
-
-        address newFund = makeAddr("newFund");
-        vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSignature("LoansOutstanding()"));
-        pool.setFundAccount(newFund);
-    }
-
-    function test_setFundAccount_succeedsWithNoLoans() public {
-        address newFund = makeAddr("newFund");
-        vm.prank(owner);
-        pool.setFundAccount(newFund);
-        assertEq(pool.fundAccount(), newFund);
-    }
-
-    function test_setFundAccount_succeedsAfterFullRepay() public {
-        _depositAs(lender1, 100_000_000);
-        _borrow(1, 50_000_000);
-
-        vm.prank(borrower);
-        usdc.approve(address(pool), 50_000_000);
-        _repay(1);
-
-        address newFund = makeAddr("newFund");
-        vm.prank(owner);
-        pool.setFundAccount(newFund);
-        assertEq(pool.fundAccount(), newFund);
     }
 
     // ── Audit #4: Ownable2Step ──────────────────────────────────────────
