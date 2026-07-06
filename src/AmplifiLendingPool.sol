@@ -43,6 +43,34 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     uint256 public kinkRateBps;
     uint256 public maxRateBps;
 
+    // ── Risk controls (direct-routing operator blast-radius mitigation) ──
+    // In the direct-routing model borrow() disburses to any `wallet` the teeOperator
+    // names. A compromised operator hot key could otherwise route the pool's entire
+    // available liquidity to an address it controls. These OWNER-gated controls bound
+    // and constrain that: they change nothing until an owner sets them (all default to
+    // 0 / false), so existing behaviour is preserved.
+
+    // Optional borrower-wallet allowlist. When enabled, borrow() only disburses to
+    // pre-approved wallets — fully restoring the "operator cannot divert funds to an
+    // arbitrary address" invariant, PROVIDED the owner (who manages the list) is a
+    // colder key than the hot teeOperator. Off by default (behaviour-neutral).
+    bool public borrowAllowlistEnabled;
+    mapping(address wallet => bool allowed) public allowedBorrowerWallet;
+
+    // Borrow circuit breakers (0 = disabled). `maxBorrowPerLoan` caps a single borrow;
+    // `maxBorrowPerWindow` caps cumulative borrows inside a rolling `borrowWindow`
+    // (tumbling), bounding how much a compromised operator can drain in one burst before
+    // monitoring/owner can react (Close the pool, rotate the operator).
+    uint256 public maxBorrowPerLoan;
+    uint256 public maxBorrowPerWindow;
+    uint256 public borrowWindow;
+    uint256 public windowStart;
+    uint256 public windowBorrowed;
+
+    // Cumulative bad debt realized across all loans — a cheap on-chain counter for
+    // monitoring/alerting on write-offs (the per-loan BadDebtRealized event still fires).
+    uint256 public totalBadDebtRealized;
+
     // ── Constants ───────────────────────────────────────────────────────
     uint256 private constant BPS = 10_000;
     uint256 private constant SECONDS_PER_YEAR = 365 days;
@@ -64,6 +92,9 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     event TeeOperatorUpdated(address indexed oldOperator, address indexed newOperator);
     event RateParamsUpdated(uint256 baseRateBps, uint256 kinkUtilizationBps, uint256 kinkRateBps, uint256 maxRateBps);
     event PoolStatusUpdated(PoolStatus oldStatus, PoolStatus newStatus);
+    event BorrowAllowlistEnabledUpdated(bool enabled);
+    event AllowedBorrowerWalletUpdated(address indexed wallet, bool allowed);
+    event BorrowCapsUpdated(uint256 maxBorrowPerLoan, uint256 maxBorrowPerWindow, uint256 borrowWindow);
 
     // ── Errors ──────────────────────────────────────────────────────────
     error OnlyTeeOperator();
@@ -76,6 +107,9 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     error ZeroAddress();
     error LoanAlreadyExists();
     error LoanNotFound();
+    error WalletNotAllowed();
+    error BorrowCapExceeded();
+    error InvalidBorrowCaps();
 
     // ── Modifiers ───────────────────────────────────────────────────────
     modifier onlyTeeOperator() {
@@ -162,7 +196,10 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     // would let a careless or malicious setPoolStatus(Closed) permanently strand
     // lender funds and outstanding loans (audit #1, #6).
 
-    /// @notice 1-arg convenience wrapper. Burns shares from msg.sender, sends assets to msg.sender.
+    /// @notice Redeem by SHARES. Burns `shares` from msg.sender and sends the corresponding
+    ///         assets to msg.sender. WARNING: this overload takes SHARES, NOT assets — it is
+    ///         NOT the ERC-4626 `withdraw(assets,...)`. To withdraw a specific ASSET amount use
+    ///         `withdrawAssets(assets)` or the 3-arg `withdraw(assets, receiver, owner)`.
     function withdraw(uint256 shares) external nonReentrant returns (uint256 assets) {
         if (shares == 0) revert ZeroShares();
         accrueInterest();
@@ -177,11 +214,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit Withdraw(msg.sender, msg.sender, msg.sender, assets, shares);
     }
 
-    function withdraw(uint256 assets, address receiver, address _owner)
-        external
-        nonReentrant
-        returns (uint256 shares)
-    {
+    function withdraw(uint256 assets, address receiver, address _owner) external nonReentrant returns (uint256 shares) {
         if (assets == 0) revert ZeroAmount();
         if (receiver == address(0)) revert ZeroAddress();
         accrueInterest();
@@ -200,11 +233,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit Withdraw(msg.sender, receiver, _owner, assets, shares);
     }
 
-    function redeem(uint256 shares, address receiver, address _owner)
-        external
-        nonReentrant
-        returns (uint256 assets)
-    {
+    function redeem(uint256 shares, address receiver, address _owner) external nonReentrant returns (uint256 assets) {
         if (shares == 0) revert ZeroShares();
         if (receiver == address(0)) revert ZeroAddress();
         accrueInterest();
@@ -248,6 +277,8 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         if (amount == 0) revert ZeroAmount();
         if (wallet == address(0)) revert ZeroAddress();
         if (loanShares[loanId] != 0) revert LoanAlreadyExists();
+
+        _enforceBorrowControls(wallet, amount);
 
         accrueInterest();
 
@@ -296,6 +327,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
         emit Repay(loanId, wallet, repaid, shares);
         if (badDebt > 0) {
+            totalBadDebtRealized += badDebt;
             emit BadDebtRealized(loanId, badDebt);
         }
     }
@@ -422,12 +454,10 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         teeOperator = _teeOperator;
     }
 
-    function setRateParams(
-        uint256 _baseRateBps,
-        uint256 _kinkUtilizationBps,
-        uint256 _kinkRateBps,
-        uint256 _maxRateBps
-    ) external onlyOwner {
+    function setRateParams(uint256 _baseRateBps, uint256 _kinkUtilizationBps, uint256 _kinkRateBps, uint256 _maxRateBps)
+        external
+        onlyOwner
+    {
         _validateRateParams(_baseRateBps, _kinkUtilizationBps, _kinkRateBps, _maxRateBps);
         accrueInterest();
         baseRateBps = _baseRateBps;
@@ -443,7 +473,65 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         status = _status;
     }
 
+    /// @notice Toggle the borrower-wallet allowlist. When enabled, borrow() reverts unless
+    ///         the target wallet is in `allowedBorrowerWallet`. Manage the list with a colder
+    ///         key than the teeOperator for the allowlist to constrain a hot-key compromise.
+    function setBorrowAllowlistEnabled(bool enabled) external onlyOwner {
+        borrowAllowlistEnabled = enabled;
+        emit BorrowAllowlistEnabledUpdated(enabled);
+    }
+
+    function setAllowedBorrowerWallet(address wallet, bool allowed) external onlyOwner {
+        if (wallet == address(0)) revert ZeroAddress();
+        allowedBorrowerWallet[wallet] = allowed;
+        emit AllowedBorrowerWalletUpdated(wallet, allowed);
+    }
+
+    /// @notice Batch variant of setAllowedBorrowerWallet — set the same `allowed` flag for many wallets.
+    function setAllowedBorrowerWallets(address[] calldata wallets, bool allowed) external onlyOwner {
+        uint256 len = wallets.length;
+        for (uint256 i; i < len; ++i) {
+            if (wallets[i] == address(0)) revert ZeroAddress();
+            allowedBorrowerWallet[wallets[i]] = allowed;
+            emit AllowedBorrowerWalletUpdated(wallets[i], allowed);
+        }
+    }
+
+    /// @notice Set the borrow circuit breakers. `_maxBorrowPerLoan` caps a single borrow;
+    ///         `_maxBorrowPerWindow` caps cumulative borrows inside a rolling `_borrowWindow`
+    ///         (seconds). Any of the caps set to 0 disables that check. Resets the running
+    ///         window. Reverts if a window cap is set without a positive window length.
+    function setBorrowCaps(uint256 _maxBorrowPerLoan, uint256 _maxBorrowPerWindow, uint256 _borrowWindow)
+        external
+        onlyOwner
+    {
+        if (_maxBorrowPerWindow != 0 && _borrowWindow == 0) revert InvalidBorrowCaps();
+        maxBorrowPerLoan = _maxBorrowPerLoan;
+        maxBorrowPerWindow = _maxBorrowPerWindow;
+        borrowWindow = _borrowWindow;
+        windowStart = block.timestamp;
+        windowBorrowed = 0;
+        emit BorrowCapsUpdated(_maxBorrowPerLoan, _maxBorrowPerWindow, _borrowWindow);
+    }
+
     // ── Internal ────────────────────────────────────────────────────────
+
+    /// @dev Enforce the OWNER-configured borrow controls (allowlist + per-loan cap + rolling
+    ///      window cap). All checks are no-ops until an owner sets them. On the window cap this
+    ///      advances the tumbling window and accumulates `windowBorrowed`; a later revert in
+    ///      borrow() rolls that back with the rest of the tx.
+    function _enforceBorrowControls(address wallet, uint256 amount) internal {
+        if (borrowAllowlistEnabled && !allowedBorrowerWallet[wallet]) revert WalletNotAllowed();
+        if (maxBorrowPerLoan != 0 && amount > maxBorrowPerLoan) revert BorrowCapExceeded();
+        if (maxBorrowPerWindow != 0) {
+            if (block.timestamp >= windowStart + borrowWindow) {
+                windowStart = block.timestamp;
+                windowBorrowed = 0;
+            }
+            if (windowBorrowed + amount > maxBorrowPerWindow) revert BorrowCapExceeded();
+            windowBorrowed += amount;
+        }
+    }
 
     /// @dev Convert borrow assets to shares. Rounds UP (favors protocol on borrow).
     function _borrowSharesToMint(uint256 assets) internal view returns (uint256) {
