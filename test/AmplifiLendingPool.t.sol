@@ -1338,14 +1338,68 @@ contract AmplifiLendingPoolTest is Test {
         assertEq(pool.totalBadDebtRealized(), afterFirst + 30_000_000, "repay(0) adds full debt to counter");
     }
 
+    function test_allowlistAndCaps_bothEnforced() public {
+        // Allowlist and caps compose: whichever the borrow violates reverts; both satisfied → success.
+        _depositAs(lender1, 1_000_000_000);
+        address w = makeAddr("combo");
+        vm.startPrank(owner);
+        pool.setBorrowAllowlistEnabled(true);
+        pool.setAllowedBorrowerWallet(w, true);
+        pool.setBorrowCaps(50_000_000, 0, 0);
+        vm.stopPrank();
+
+        // allowed wallet but over per-loan cap → cap wins
+        vm.prank(teeOperator);
+        vm.expectRevert(AmplifiLendingPool.BorrowCapExceeded.selector);
+        pool.borrow(1, 60_000_000, w);
+
+        // non-allowed wallet under cap → allowlist wins (checked before the cap)
+        vm.prank(teeOperator);
+        vm.expectRevert(AmplifiLendingPool.WalletNotAllowed.selector);
+        pool.borrow(2, 10_000_000, makeAddr("notallowed"));
+
+        // allowed + under cap → success
+        _borrow(3, 40_000_000, w);
+        assertEq(pool.loanShares(3), 40_000_000);
+    }
+
+    function test_setAllowedBorrowerWallet_zeroAddr_reverts() public {
+        vm.prank(owner);
+        vm.expectRevert(AmplifiLendingPool.ZeroAddress.selector);
+        pool.setAllowedBorrowerWallet(address(0), true);
+    }
+
+    function test_borrowControls_setters_emitEvents() public {
+        address w = makeAddr("evtWallet");
+        vm.startPrank(owner);
+
+        vm.expectEmit(false, false, false, true, address(pool));
+        emit AmplifiLendingPool.BorrowAllowlistEnabledUpdated(true);
+        pool.setBorrowAllowlistEnabled(true);
+
+        vm.expectEmit(true, false, false, true, address(pool));
+        emit AmplifiLendingPool.AllowedBorrowerWalletUpdated(w, true);
+        pool.setAllowedBorrowerWallet(w, true);
+
+        vm.expectEmit(false, false, false, true, address(pool));
+        emit AmplifiLendingPool.BorrowCapsUpdated(1_000_000, 5_000_000, 3600);
+        pool.setBorrowCaps(1_000_000, 5_000_000, 3600);
+
+        vm.stopPrank();
+    }
+
     // ── Access control on new setters ───────────────────────────────────
 
     function test_borrowControls_onlyOwner() public {
+        address[] memory ws = new address[](1);
+        ws[0] = makeAddr("w");
         vm.startPrank(teeOperator); // not the owner
         vm.expectRevert();
         pool.setBorrowAllowlistEnabled(true);
         vm.expectRevert();
         pool.setAllowedBorrowerWallet(makeAddr("w"), true);
+        vm.expectRevert();
+        pool.setAllowedBorrowerWallets(ws, true);
         vm.expectRevert();
         pool.setBorrowCaps(1, 0, 0);
         vm.stopPrank();
