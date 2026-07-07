@@ -34,9 +34,7 @@ contract AmplifiLendingPoolTest is Test {
 
     function setUp() public {
         usdc = new MockUSDC();
-        pool = new AmplifiLendingPool(
-            address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE
-        );
+        pool = new AmplifiLendingPool(address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -1179,4 +1177,231 @@ contract AmplifiLendingPoolTest is Test {
     // A proper reentrancy test would need a malicious ERC20 with transfer hooks,
     // but that's not possible with USDC (standard ERC20). The guard is tested
     // implicitly by the fact that all state-changing functions use nonReentrant.
+
+    // ── Borrow controls: allowlist ──────────────────────────────────────
+
+    function test_borrowControls_disabledByDefault() public {
+        // Fresh pool: allowlist off, both caps 0 — borrow to any wallet works.
+        assertEq(pool.borrowAllowlistEnabled(), false);
+        assertEq(pool.maxBorrowPerLoan(), 0);
+        assertEq(pool.maxBorrowPerWindow(), 0);
+        _depositAs(lender1, 1_000_000_000);
+        _borrow(1, 500_000_000, makeAddr("arbitrary"));
+        assertEq(pool.loanShares(1), 500_000_000, "borrow to arbitrary wallet allowed when controls off");
+    }
+
+    function test_allowlist_blocksNonAllowedWallet() public {
+        _depositAs(lender1, 1_000_000_000);
+        vm.prank(owner);
+        pool.setBorrowAllowlistEnabled(true);
+
+        vm.prank(teeOperator);
+        vm.expectRevert(AmplifiLendingPool.WalletNotAllowed.selector);
+        pool.borrow(1, 100_000_000, makeAddr("rogue"));
+    }
+
+    function test_allowlist_permitsAllowedWallet() public {
+        _depositAs(lender1, 1_000_000_000);
+        address w = makeAddr("legit");
+        vm.startPrank(owner);
+        pool.setBorrowAllowlistEnabled(true);
+        pool.setAllowedBorrowerWallet(w, true);
+        vm.stopPrank();
+
+        _borrow(1, 100_000_000, w);
+        assertEq(pool.loanWallet(1), w);
+    }
+
+    function test_allowlist_batchSetterAndRevoke() public {
+        _depositAs(lender1, 1_000_000_000);
+        address w1 = makeAddr("w1");
+        address w2 = makeAddr("w2");
+        address[] memory ws = new address[](2);
+        ws[0] = w1;
+        ws[1] = w2;
+
+        vm.startPrank(owner);
+        pool.setBorrowAllowlistEnabled(true);
+        pool.setAllowedBorrowerWallets(ws, true);
+        vm.stopPrank();
+
+        _borrow(1, 10_000_000, w1);
+        _borrow(2, 10_000_000, w2);
+
+        // Revoke w2 in batch; w1 still borrows, w2 blocked.
+        address[] memory revoke = new address[](1);
+        revoke[0] = w2;
+        vm.prank(owner);
+        pool.setAllowedBorrowerWallets(revoke, false);
+
+        _borrow(3, 10_000_000, w1);
+        vm.prank(teeOperator);
+        vm.expectRevert(AmplifiLendingPool.WalletNotAllowed.selector);
+        pool.borrow(4, 10_000_000, w2);
+    }
+
+    function test_allowlist_disableRestoresOpenBorrow() public {
+        _depositAs(lender1, 1_000_000_000);
+        vm.prank(owner);
+        pool.setBorrowAllowlistEnabled(true);
+
+        vm.prank(teeOperator);
+        vm.expectRevert(AmplifiLendingPool.WalletNotAllowed.selector);
+        pool.borrow(1, 10_000_000, makeAddr("x"));
+
+        vm.prank(owner);
+        pool.setBorrowAllowlistEnabled(false);
+        _borrow(1, 10_000_000, makeAddr("x")); // now allowed
+        assertEq(pool.loanShares(1), 10_000_000);
+    }
+
+    // ── Borrow controls: caps ───────────────────────────────────────────
+
+    function test_borrowCap_perLoan() public {
+        _depositAs(lender1, 1_000_000_000);
+        vm.prank(owner);
+        pool.setBorrowCaps(50_000_000, 0, 0); // 50 USDC per-loan cap
+
+        vm.prank(teeOperator);
+        vm.expectRevert(AmplifiLendingPool.BorrowCapExceeded.selector);
+        pool.borrow(1, 50_000_001, borrower);
+
+        _borrow(2, 50_000_000, borrower); // exactly at cap is allowed
+        assertEq(pool.loanShares(2), 50_000_000);
+    }
+
+    function test_borrowCap_window_blocksBurst() public {
+        _depositAs(lender1, 1_000_000_000);
+        vm.prank(owner);
+        pool.setBorrowCaps(0, 100_000_000, 3600); // 100 USDC per rolling hour
+
+        _borrow(1, 60_000_000, borrower);
+        assertEq(pool.windowBorrowed(), 60_000_000);
+
+        vm.prank(teeOperator);
+        vm.expectRevert(AmplifiLendingPool.BorrowCapExceeded.selector);
+        pool.borrow(2, 60_000_000, borrower); // 60 + 60 > 100
+    }
+
+    function test_borrowCap_window_notRefundedByRepay() public {
+        // The window cap bounds GROSS borrow-out per window; repaying does not free budget.
+        _depositAs(lender1, 1_000_000_000);
+        vm.prank(owner);
+        pool.setBorrowCaps(0, 100_000_000, 3600);
+
+        _borrow(1, 60_000_000, borrower);
+        vm.prank(borrower);
+        usdc.approve(address(pool), type(uint256).max);
+        _repay(1);
+
+        vm.prank(teeOperator);
+        vm.expectRevert(AmplifiLendingPool.BorrowCapExceeded.selector);
+        pool.borrow(2, 60_000_000, borrower); // still 60 spent in window despite repay
+    }
+
+    function test_borrowCap_window_resetsAfterElapsed() public {
+        _depositAs(lender1, 1_000_000_000);
+        vm.prank(owner);
+        pool.setBorrowCaps(0, 100_000_000, 3600);
+
+        _borrow(1, 90_000_000, borrower);
+        vm.warp(block.timestamp + 3601); // next window
+        _borrow(2, 90_000_000, borrower); // fresh budget
+        assertEq(pool.windowBorrowed(), 90_000_000);
+    }
+
+    function test_borrowCap_invalidParams_reverts() public {
+        vm.prank(owner);
+        vm.expectRevert(AmplifiLendingPool.InvalidBorrowCaps.selector);
+        pool.setBorrowCaps(0, 100_000_000, 0); // window cap with zero window length
+    }
+
+    // ── Bad-debt accounting ─────────────────────────────────────────────
+
+    function test_totalBadDebtRealized_accumulates() public {
+        _depositAs(lender1, 1_000_000_000);
+        assertEq(pool.totalBadDebtRealized(), 0);
+
+        // Loan 1: partial repay leaves a shortfall.
+        _borrow(1, 100_000_000, borrower);
+        vm.prank(borrower);
+        usdc.approve(address(pool), type(uint256).max);
+        vm.prank(teeOperator);
+        pool.repay(1, 40_000_000); // debt ~100, repay 40 → ~60 bad debt
+        uint256 afterFirst = pool.totalBadDebtRealized();
+        assertGt(afterFirst, 0, "partial repay books bad debt");
+
+        // Loan 2: total write-off via repay(id, 0).
+        _borrow(2, 30_000_000, borrower);
+        vm.prank(teeOperator);
+        pool.repay(2, 0);
+        assertEq(pool.totalBadDebtRealized(), afterFirst + 30_000_000, "repay(0) adds full debt to counter");
+    }
+
+    function test_allowlistAndCaps_bothEnforced() public {
+        // Allowlist and caps compose: whichever the borrow violates reverts; both satisfied → success.
+        _depositAs(lender1, 1_000_000_000);
+        address w = makeAddr("combo");
+        vm.startPrank(owner);
+        pool.setBorrowAllowlistEnabled(true);
+        pool.setAllowedBorrowerWallet(w, true);
+        pool.setBorrowCaps(50_000_000, 0, 0);
+        vm.stopPrank();
+
+        // allowed wallet but over per-loan cap → cap wins
+        vm.prank(teeOperator);
+        vm.expectRevert(AmplifiLendingPool.BorrowCapExceeded.selector);
+        pool.borrow(1, 60_000_000, w);
+
+        // non-allowed wallet under cap → allowlist wins (checked before the cap)
+        vm.prank(teeOperator);
+        vm.expectRevert(AmplifiLendingPool.WalletNotAllowed.selector);
+        pool.borrow(2, 10_000_000, makeAddr("notallowed"));
+
+        // allowed + under cap → success
+        _borrow(3, 40_000_000, w);
+        assertEq(pool.loanShares(3), 40_000_000);
+    }
+
+    function test_setAllowedBorrowerWallet_zeroAddr_reverts() public {
+        vm.prank(owner);
+        vm.expectRevert(AmplifiLendingPool.ZeroAddress.selector);
+        pool.setAllowedBorrowerWallet(address(0), true);
+    }
+
+    function test_borrowControls_setters_emitEvents() public {
+        address w = makeAddr("evtWallet");
+        vm.startPrank(owner);
+
+        vm.expectEmit(false, false, false, true, address(pool));
+        emit AmplifiLendingPool.BorrowAllowlistEnabledUpdated(true);
+        pool.setBorrowAllowlistEnabled(true);
+
+        vm.expectEmit(true, false, false, true, address(pool));
+        emit AmplifiLendingPool.AllowedBorrowerWalletUpdated(w, true);
+        pool.setAllowedBorrowerWallet(w, true);
+
+        vm.expectEmit(false, false, false, true, address(pool));
+        emit AmplifiLendingPool.BorrowCapsUpdated(1_000_000, 5_000_000, 3600);
+        pool.setBorrowCaps(1_000_000, 5_000_000, 3600);
+
+        vm.stopPrank();
+    }
+
+    // ── Access control on new setters ───────────────────────────────────
+
+    function test_borrowControls_onlyOwner() public {
+        address[] memory ws = new address[](1);
+        ws[0] = makeAddr("w");
+        vm.startPrank(teeOperator); // not the owner
+        vm.expectRevert();
+        pool.setBorrowAllowlistEnabled(true);
+        vm.expectRevert();
+        pool.setAllowedBorrowerWallet(makeAddr("w"), true);
+        vm.expectRevert();
+        pool.setAllowedBorrowerWallets(ws, true);
+        vm.expectRevert();
+        pool.setBorrowCaps(1, 0, 0);
+        vm.stopPrank();
+    }
 }
