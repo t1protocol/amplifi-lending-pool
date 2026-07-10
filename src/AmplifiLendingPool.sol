@@ -272,9 +272,10 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     // ── Borrow / Repay ──────────────────────────────────────────────────
 
     /// @notice Open a loan, disbursing the principal directly to `wallet` (the
-    ///         borrower's deposit wallet). Repayment is later pulled from the same
-    ///         wallet by repay(). Caller (teeOperator) is trusted to pass the
-    ///         wallet that posted collateral for this loan.
+    ///         borrower's deposit wallet). That same wallet later repays by pushing
+    ///         the repayment to this pool and calling repay() (see repay()). Caller
+    ///         (teeOperator) is trusted to pass the wallet that posted collateral for
+    ///         this loan.
     function borrow(uint256 loanId, uint256 amount, address wallet) external nonReentrant onlyTeeOperator whenActive {
         if (amount == 0) revert ZeroAmount();
         if (wallet == address(0)) revert ZeroAddress();
