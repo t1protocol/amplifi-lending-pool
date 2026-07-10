@@ -31,10 +31,11 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     // ── Loan tracking ─────────────────────────────────────────────────
     mapping(uint256 loanId => uint256 shares) public loanShares;
-    // Per-loan borrower wallet. borrow() disburses the principal here and repay()
-    // pulls the repayment from here (via allowance). Replaces the single global
-    // fundAccount so funds flow pool<->deposit-wallet directly — no commingling,
-    // and each loan's borrower is recorded on-chain.
+    // Per-loan borrower wallet. borrow() disburses the principal here, and repay()
+    // is called BY this wallet after it has pushed the repayment to the pool (see
+    // repay()). Replaces the single global fundAccount so funds flow
+    // pool<->deposit-wallet directly — no commingling, and each loan's borrower is
+    // recorded on-chain and gates who may repay it.
     mapping(uint256 loanId => address wallet) public loanWallet;
 
     // ── Interest Rate Model ─────────────────────────────────────────────
@@ -98,6 +99,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     // ── Errors ──────────────────────────────────────────────────────────
     error OnlyTeeOperator();
+    error OnlyBorrowerWallet();
     error PoolNotActive();
     error InsufficientLiquidity();
     error ZeroAmount();
@@ -270,9 +272,10 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     // ── Borrow / Repay ──────────────────────────────────────────────────
 
     /// @notice Open a loan, disbursing the principal directly to `wallet` (the
-    ///         borrower's deposit wallet). Repayment is later pulled from the same
-    ///         wallet by repay(). Caller (teeOperator) is trusted to pass the
-    ///         wallet that posted collateral for this loan.
+    ///         borrower's deposit wallet). That same wallet later repays by pushing
+    ///         the repayment to this pool and calling repay() (see repay()). Caller
+    ///         (teeOperator) is trusted to pass the wallet that posted collateral for
+    ///         this loan.
     function borrow(uint256 loanId, uint256 amount, address wallet) external nonReentrant onlyTeeOperator whenActive {
         if (amount == 0) revert ZeroAmount();
         if (wallet == address(0)) revert ZeroAddress();
@@ -295,25 +298,39 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit Borrow(loanId, wallet, amount, shares);
     }
 
-    /// @notice Repay a loan, pulling the repayment from the loan's borrower wallet
-    ///         (set at borrow) via allowance, and writing off any shortfall as bad
-    ///         debt absorbed by lenders.
-    /// @dev Handles both full repayment and partial repayment in a single function.
-    ///      When maxRepay >= debt, behaves as a normal full repay (no bad debt).
-    ///      When maxRepay < debt (e.g., interest drift exceeded user equity, or the
-    ///      wallet holds less than the debt), the shortfall reduces totalBorrowAssets
-    ///      without corresponding USDC inflow. Lenders absorb the loss proportionally
-    ///      via reduced share price. The wallet must have approved this pool for at
-    ///      least `repaid` pUSD, and hold that balance, or the transferFrom reverts.
-    function repay(uint256 loanId, uint256 maxRepay) external nonReentrant onlyTeeOperator {
+    /// @notice Repay a loan. PUSH-based: the loan's borrower wallet transfers the
+    ///         repayment pUSD to this pool and then calls repay — both in the SAME
+    ///         atomic transaction (a Polymarket relayer WALLET batch). Nothing is
+    ///         pulled here: a `transferFrom` would need the wallet to `approve` this
+    ///         pool, and Polymarket's relayer permanently blocks a deposit wallet
+    ///         approving any non-Polymarket spender (drain protection), so the pull
+    ///         model is impossible. The pushed pUSD is already in this pool's
+    ///         balance — and therefore already in availableLiquidity()/totalAssets(),
+    ///         since idle liquidity is measured by balanceOf — so accounting stays
+    ///         exactly as before; repay only settles the loan bookkeeping.
+    /// @dev Gated to the loan's own wallet (`loanWallet[loanId]`), which is an
+    ///      amplifi-server-controlled deposit wallet — no external party can call it.
+    ///      This is the same trust boundary as the previous `onlyTeeOperator` gate:
+    ///      the caller is trusted to have pushed `amount` pUSD in the same batch, just
+    ///      as the operator was trusted to have set an approval. A relayer batch is
+    ///      all-or-nothing (it reverts as a unit if any call, incl. the transfer,
+    ///      would fail), so repay cannot execute without its paired push.
+    /// @param amount The pUSD the wallet pushed for this repayment. The loan is
+    ///        credited min(amount, debt); a shortfall (amount < debt — e.g. an
+    ///        under-collateralized liquidation) is written off as bad debt absorbed
+    ///        by lenders via reduced share price. Callers push exactly what they
+    ///        intend to credit (full debt, or the recovered proceeds on a
+    ///        liquidation); any excess over the debt stays as pool liquidity.
+    function repay(uint256 loanId, uint256 amount) external nonReentrant {
         uint256 shares = loanShares[loanId];
         if (shares == 0) revert LoanNotFound();
+        address wallet = loanWallet[loanId];
+        if (msg.sender != wallet) revert OnlyBorrowerWallet();
 
         accrueInterest();
 
-        address wallet = loanWallet[loanId];
         uint256 debt = _borrowAssetsOwed(shares);
-        uint256 repaid = debt < maxRepay ? debt : maxRepay;
+        uint256 repaid = debt < amount ? debt : amount;
         uint256 badDebt = debt - repaid;
 
         delete loanShares[loanId];
@@ -321,9 +338,8 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         totalBorrowShares -= shares;
         totalBorrowAssets -= debt;
 
-        if (repaid > 0) {
-            usdc.safeTransferFrom(wallet, address(this), repaid);
-        }
+        // No transferFrom — the wallet pushed the repayment to this pool in the same
+        // atomic batch immediately before calling repay (see @notice).
 
         emit Repay(loanId, wallet, repaid, shares);
         if (badDebt > 0) {
