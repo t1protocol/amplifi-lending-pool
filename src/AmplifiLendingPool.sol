@@ -472,8 +472,21 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     function setRateParams(uint256 _baseRateBps, uint256 _kinkUtilizationBps, uint256 _kinkRateBps, uint256 _maxRateBps)
         external
+        virtual
         onlyOwner
     {
+        _setRateParams(_baseRateBps, _kinkUtilizationBps, _kinkRateBps, _maxRateBps);
+    }
+
+    /// @dev Validate, accrue, apply and emit the rate-model update. Access control lives in the
+    ///      external `setRateParams` (onlyOwner here); a subclass may expose it under a different
+    ///      gate (e.g. a delegated rate admin) by overriding that external function and calling this.
+    function _setRateParams(
+        uint256 _baseRateBps,
+        uint256 _kinkUtilizationBps,
+        uint256 _kinkRateBps,
+        uint256 _maxRateBps
+    ) internal virtual {
         _validateRateParams(_baseRateBps, _kinkUtilizationBps, _kinkRateBps, _maxRateBps);
         accrueInterest();
         baseRateBps = _baseRateBps;
