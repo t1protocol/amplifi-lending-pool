@@ -8,7 +8,7 @@ import {AmplifiLendingPool} from "./AmplifiLendingPool.sol";
 ///         role, so a partner can set their own rate params without holding owner power. The
 ///         owner appoints/rotates/revokes the rateAdmin and retains every other privilege
 ///         (teeOperator, pool status, borrow controls) plus the ability to set rate params.
-///         The rateAdmin can ONLY call setRateParams — nothing else.
+///         The rateAdmin can ONLY call setRateParams. Nothing else.
 contract RateAdminLendingPool is AmplifiLendingPool {
     /// @notice Address permitted to set rate params in addition to the owner. address(0) = unset.
     address public rateAdmin;

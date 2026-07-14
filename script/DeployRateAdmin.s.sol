@@ -4,10 +4,10 @@ pragma solidity ^0.8.24;
 import {Script, console2} from "forge-std/Script.sol";
 import {RateAdminLendingPool} from "../src/RateAdminLendingPool.sol";
 
-/// @notice Deploys RateAdminLendingPool — the AmplifiLendingPool variant with a delegated
+/// @notice Deploys RateAdminLendingPool, the AmplifiLendingPool variant with a delegated
 ///         `rateAdmin` role. Same env-var interface as Deploy.s.sol, plus RATE_ADMIN_ADDRESS.
 contract DeployRateAdmin is Script {
-    // Polygon mainnet defaults — override via env for other chains (e.g. Injective EVM).
+    // Polygon mainnet defaults. Override via env for other chains (e.g. Injective EVM).
     address constant DEFAULT_UNDERLYING = 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB; // pUSD
     address constant DEFAULT_TEE_OPERATOR = 0xAA270BeAC402474A3eDF164C51CdAD9597f01707;
 
@@ -21,7 +21,7 @@ contract DeployRateAdmin is Script {
         address underlying = vm.envOr("UNDERLYING_ADDRESS", DEFAULT_UNDERLYING);
         address owner = vm.envAddress("OWNER_ADDRESS");
         address teeOperator = vm.envOr("TEE_OPERATOR_ADDRESS", DEFAULT_TEE_OPERATOR);
-        // Optional: address(0) deploys with the role unset — assign later via setRateAdmin().
+        // Optional: address(0) deploys with the role unset; assign later via setRateAdmin().
         address rateAdmin = vm.envOr("RATE_ADMIN_ADDRESS", address(0));
 
         uint256 baseRateBps = vm.envOr("BASE_RATE_BPS", DEFAULT_BASE_RATE_BPS);
