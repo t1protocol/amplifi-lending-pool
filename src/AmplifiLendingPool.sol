@@ -19,88 +19,47 @@ enum PoolStatus {
 contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     using SafeERC20 for IERC20;
 
-    // ── Immutables ──────────────────────────────────────────────────────
     IERC20 public immutable usdc;
 
-    // ── State ───────────────────────────────────────────────────────────
     address public teeOperator;
     PoolStatus public status;
     uint256 public totalBorrowAssets;
     uint256 public totalBorrowShares;
     uint256 public lastAccrualTimestamp;
 
-    // ── Loan tracking ─────────────────────────────────────────────────
     mapping(uint256 loanId => uint256 shares) public loanShares;
-    // Per-loan borrower wallet. borrow() disburses the principal here, and repay()
-    // is called BY this wallet after it has pushed the repayment to the pool (see
-    // repay()). Replaces the single global fundAccount so funds flow
-    // pool<->deposit-wallet directly, no commingling, and each loan's borrower is
-    // recorded on-chain and gates who may repay it.
     mapping(uint256 loanId => address wallet) public loanWallet;
-    // Original principal borrowed per loan, recorded at borrow() and used at repay() to
-    // split the settled interest (debt - principal) between lenders and the protocol fee.
     mapping(uint256 loanId => uint256 principal) public loanPrincipal;
 
-    // ── Protocol fee ────────────────────────────────────────────────────
-    // Optional owner-set fee taken from the interest on FULLY repaid loans (no bad debt).
-    // Off by default (feeBps = 0, behaviour-neutral). At repay(), fee = interest * feeBps / BPS
-    // is reserved into protocolFeesAccrued (denominated in the underlying asset) and carved out
-    // of totalAssets()/availableLiquidity() so it is neither lender NAV nor lendable liquidity.
-    // Lenders keep the remaining interest exactly as before. feeRecipient (or the owner) collects.
     uint256 public feeBps;
     address public feeRecipient;
     uint256 public protocolFeesAccrued;
 
-    // ── Interest Rate Model ─────────────────────────────────────────────
     uint256 public baseRateBps;
     uint256 public kinkUtilizationBps;
     uint256 public kinkRateBps;
     uint256 public maxRateBps;
 
-    // ── Risk controls (direct-routing operator blast-radius mitigation) ──
-    // In the direct-routing model borrow() disburses to any `wallet` the teeOperator
-    // names. A compromised operator hot key could otherwise route the pool's entire
-    // available liquidity to an address it controls. These OWNER-gated controls bound
-    // and constrain that: they change nothing until an owner sets them (all default to
-    // 0 / false), so existing behaviour is preserved.
-
-    // Optional borrower-wallet allowlist. When enabled, borrow() only disburses to
-    // pre-approved wallets, fully restoring the "operator cannot divert funds to an
-    // arbitrary address" invariant, PROVIDED the owner (who manages the list) is a
-    // colder key than the hot teeOperator. Off by default (behaviour-neutral).
     bool public borrowAllowlistEnabled;
     mapping(address wallet => bool allowed) public allowedBorrowerWallet;
 
-    // Borrow circuit breakers (0 = disabled). `maxBorrowPerLoan` caps a single borrow;
-    // `maxBorrowPerWindow` caps cumulative borrows inside a rolling `borrowWindow`
-    // (tumbling), bounding how much a compromised operator can drain in one burst before
-    // monitoring/owner can react (Close the pool, rotate the operator).
     uint256 public maxBorrowPerLoan;
     uint256 public maxBorrowPerWindow;
     uint256 public borrowWindow;
     uint256 public windowStart;
     uint256 public windowBorrowed;
 
-    // Cumulative bad debt realized across all loans, a cheap on-chain counter for
-    // monitoring/alerting on write-offs (the per-loan BadDebtRealized event still fires).
     uint256 public totalBadDebtRealized;
 
-    // ── Constants ───────────────────────────────────────────────────────
     uint256 private constant BPS = 10_000;
     uint256 private constant SECONDS_PER_YEAR = 365 days;
-    // Hard ceiling on maxRateBps (10,000% APR). Prevents the rate-spike drain path
-    // where an owner with one share inflates totalBorrowAssets, rounds withdraw share
-    // cost down to 1, and burns 1 share for the whole pool.
     uint256 public constant MAX_RATE_CAP_BPS = 1_000_000;
-    // Hard ceiling on the protocol fee (50%). Bounds how much of loan interest an owner can divert.
     uint256 public constant MAX_FEE_BPS = 5_000;
-    // Virtual offset to mitigate ERC-4626 first-depositor inflation attack.
-    // See: https://docs.openzeppelin.com/contracts/5.x/erc4626#defending_with_a_virtual_offset
+    // Virtual offset against the ERC-4626 first-depositor inflation attack.
+    // https://docs.openzeppelin.com/contracts/5.x/erc4626#defending_with_a_virtual_offset
     uint256 private constant VIRTUAL_SHARES = 1e3;
     uint256 private constant VIRTUAL_ASSETS = 1e3;
 
-    // ── Events ──────────────────────────────────────────────────────────
-    // Deposit and Withdraw events are inherited from IERC4626 (with sender/owner/receiver).
     event Borrow(uint256 indexed loanId, address indexed wallet, uint256 amount, uint256 shares);
     event Repay(uint256 indexed loanId, address indexed wallet, uint256 repaid, uint256 shares);
     event BadDebtRealized(uint256 indexed loanId, uint256 badDebt);
@@ -116,7 +75,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     event ProtocolFeeAccrued(uint256 indexed loanId, uint256 interest, uint256 fee);
     event ProtocolFeesCollected(address indexed to, uint256 amount);
 
-    // ── Errors ──────────────────────────────────────────────────────────
     error OnlyTeeOperator();
     error OnlyBorrowerWallet();
     error PoolNotActive();
@@ -135,7 +93,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     error OnlyOwnerOrFeeRecipient();
     error FeeExceedsAccrued();
 
-    // ── Modifiers ───────────────────────────────────────────────────────
     modifier onlyTeeOperator() {
         if (msg.sender != teeOperator) revert OnlyTeeOperator();
         _;
@@ -146,7 +103,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         _;
     }
 
-    // ── Constructor ─────────────────────────────────────────────────────
     constructor(
         address _usdc,
         address _owner,
@@ -169,20 +125,14 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         _validateRateParams(_baseRateBps, _kinkUtilizationBps, _kinkRateBps, _maxRateBps);
     }
 
-    // ── ERC20 / IERC20Metadata Override ─────────────────────────────────
     function decimals() public pure override(ERC20, IERC20Metadata) returns (uint8) {
         return 6;
     }
-
-    // ── ERC-4626 ────────────────────────────────────────────────────────
 
     function asset() external view returns (address) {
         return address(usdc);
     }
 
-    // ── Deposits ────────────────────────────────────────────────────────
-
-    /// @notice 1-arg convenience wrapper. Mints shares to msg.sender.
     function deposit(uint256 assets) external returns (uint256 shares) {
         return deposit(assets, msg.sender);
     }
@@ -215,15 +165,11 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit Deposit(msg.sender, receiver, assets, shares);
     }
 
-    // ── Withdrawals ─────────────────────────────────────────────────────
-    // Withdraw / redeem / repay are NOT gated by PoolStatus.Closed. Gating them
-    // would let a careless or malicious setPoolStatus(Closed) permanently strand
-    // lender funds and outstanding loans (audit #1, #6).
+    // Withdraw / redeem / repay are intentionally NOT gated by PoolStatus: gating them would let
+    // setPoolStatus(Closed) permanently strand lender funds and outstanding loans (audit #1, #6).
 
-    /// @notice Redeem by SHARES. Burns `shares` from msg.sender and sends the corresponding
-    ///         assets to msg.sender. WARNING: this overload takes SHARES, NOT assets, it is
-    ///         NOT the ERC-4626 `withdraw(assets,...)`. To withdraw a specific ASSET amount use
-    ///         `withdrawAssets(assets)` or the 3-arg `withdraw(assets, receiver, owner)`.
+    /// @notice Takes SHARES, not assets. This is NOT ERC-4626 withdraw(assets); for an asset
+    ///         amount use withdrawAssets(assets) or withdraw(assets, receiver, owner).
     function withdraw(uint256 shares) external nonReentrant returns (uint256 assets) {
         if (shares == 0) revert ZeroShares();
         accrueInterest();
@@ -275,7 +221,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit Withdraw(msg.sender, receiver, _owner, assets, shares);
     }
 
-    /// @notice Backward-compat. Takes assets, burns shares from msg.sender, sends to msg.sender.
     function withdrawAssets(uint256 assets) external nonReentrant returns (uint256 shares) {
         if (assets == 0) revert ZeroAmount();
         accrueInterest();
@@ -291,13 +236,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit Withdraw(msg.sender, msg.sender, msg.sender, assets, shares);
     }
 
-    // ── Borrow / Repay ──────────────────────────────────────────────────
-
-    /// @notice Open a loan, disbursing the principal directly to `wallet` (the
-    ///         borrower's deposit wallet). That same wallet later repays by pushing
-    ///         the repayment to this pool and calling repay() (see repay()). Caller
-    ///         (teeOperator) is trusted to pass the wallet that posted collateral for
-    ///         this loan.
     function borrow(uint256 loanId, uint256 amount, address wallet) external nonReentrant onlyTeeOperator whenActive {
         if (amount == 0) revert ZeroAmount();
         if (wallet == address(0)) revert ZeroAddress();
@@ -321,29 +259,12 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit Borrow(loanId, wallet, amount, shares);
     }
 
-    /// @notice Repay a loan. PUSH-based: the loan's borrower wallet transfers the
-    ///         repayment pUSD to this pool and then calls repay, both in the SAME
-    ///         atomic transaction (a Polymarket relayer WALLET batch). Nothing is
-    ///         pulled here: a `transferFrom` would need the wallet to `approve` this
-    ///         pool, and Polymarket's relayer permanently blocks a deposit wallet
-    ///         approving any non-Polymarket spender (drain protection), so the pull
-    ///         model is impossible. The pushed pUSD is already in this pool's
-    ///         balance, and therefore already in availableLiquidity()/totalAssets(),
-    ///         since idle liquidity is measured by balanceOf, so accounting stays
-    ///         exactly as before; repay only settles the loan bookkeeping.
-    /// @dev Gated to the loan's own wallet (`loanWallet[loanId]`), which is an
-    ///      amplifi-server-controlled deposit wallet, no external party can call it.
-    ///      This is the same trust boundary as the previous `onlyTeeOperator` gate:
-    ///      the caller is trusted to have pushed `amount` pUSD in the same batch, just
-    ///      as the operator was trusted to have set an approval. A relayer batch is
-    ///      all-or-nothing (it reverts as a unit if any call, incl. the transfer,
-    ///      would fail), so repay cannot execute without its paired push.
-    /// @param amount The pUSD the wallet pushed for this repayment. The loan is
-    ///        credited min(amount, debt); a shortfall (amount < debt, e.g. an
-    ///        under-collateralized liquidation) is written off as bad debt absorbed
-    ///        by lenders via reduced share price. Callers push exactly what they
-    ///        intend to credit (full debt, or the recovered proceeds on a
-    ///        liquidation); any excess over the debt stays as pool liquidity.
+    /// @notice Push-based: the loan's wallet must transfer the repayment to this pool in the same
+    ///         atomic batch, immediately before calling this. There is no transferFrom (the deposit
+    ///         wallets cannot approve a non-Polymarket spender), so the pushed funds are already in
+    ///         balance and repay only settles the bookkeeping. Gated to loanWallet[loanId].
+    /// @param amount Credited min(amount, debt); any shortfall is written off as bad debt (absorbed
+    ///        by lenders via share price). Excess over debt stays as pool liquidity.
     function repay(uint256 loanId, uint256 amount) external nonReentrant {
         uint256 shares = loanShares[loanId];
         if (shares == 0) revert LoanNotFound();
@@ -363,17 +284,11 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         totalBorrowShares -= shares;
         totalBorrowAssets -= debt;
 
-        // No transferFrom, the wallet pushed the repayment to this pool in the same
-        // atomic batch immediately before calling repay (see @notice).
-
         emit Repay(loanId, wallet, repaid, shares);
         if (badDebt > 0) {
             totalBadDebtRealized += badDebt;
             emit BadDebtRealized(loanId, badDebt);
         } else if (feeBps > 0) {
-            // Loan repaid in full: take feeBps of the settled interest for the protocol. The
-            // pushed repayment (>= debt) is already in this pool's balance, so reserving the fee
-            // is pure accounting: it stays as pool liquidity until collectProtocolFees().
             uint256 interest = debt > principal ? debt - principal : 0;
             uint256 fee = (interest * feeBps) / BPS;
             if (fee > 0) {
@@ -382,8 +297,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
             }
         }
     }
-
-    // ── Interest ────────────────────────────────────────────────────────
 
     function accrueInterest() public {
         uint256 elapsed = block.timestamp - lastAccrualTimestamp;
@@ -406,8 +319,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         return _borrowRateAtUtilization(utilization());
     }
 
-    // ── View Functions ──────────────────────────────────────────────────
-
     function totalBorrowed() external view returns (uint256) {
         return totalBorrowAssets + _pendingInterest();
     }
@@ -421,23 +332,18 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     function totalAssets() public view returns (uint256) {
         uint256 gross = usdc.balanceOf(address(this)) + totalBorrowAssets + _pendingInterest();
-        // Reserved protocol fees are not lender NAV. Saturating subtraction as a defensive
-        // guard against underflow (the invariant balance >= protocolFeesAccrued always holds).
         return gross > protocolFeesAccrued ? gross - protocolFeesAccrued : 0;
     }
 
     function availableLiquidity() public view returns (uint256) {
         uint256 bal = usdc.balanceOf(address(this));
-        // Reserved protocol fees are earmarked, so not borrowable or withdrawable by lenders.
         return bal > protocolFeesAccrued ? bal - protocolFeesAccrued : 0;
     }
 
     function utilization() public view returns (uint256) {
         if (totalBorrowAssets == 0) return 0;
 
-        // Estimate pending interest using the last-accrued utilization-derived rate.
-        // This avoids borrowRate() <-> _pendingInterest() recursion while keeping
-        // utilization aligned with outstanding debt including unaccrued interest.
+        // Two-step to avoid a borrowRate() <-> _pendingInterest() recursion.
         uint256 baseUtil = _utilizationWithBorrowAssets(totalBorrowAssets);
         uint256 baseRate = _borrowRateAtUtilization(baseUtil);
         uint256 adjustedBorrowAssets = totalBorrowAssets + _pendingInterestAtRate(baseRate);
@@ -451,8 +357,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     function assetsToShares(uint256 assets) public view returns (uint256) {
         return (assets * (totalSupply() + VIRTUAL_SHARES)) / (totalAssets() + VIRTUAL_ASSETS);
     }
-
-    // ── ERC-4626 View Functions ──────────────────────────────────────────
 
     function maxDeposit(address) external view returns (uint256) {
         return status == PoolStatus.Active ? type(uint256).max : 0;
@@ -479,14 +383,12 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     }
 
     function previewMint(uint256 shares) public view returns (uint256) {
-        // Round UP (favors pool): assets = ceil(shares * (totalAssets + VA) / (totalSupply + VS))
-        uint256 supplyAndVirtual = totalSupply() + VIRTUAL_SHARES;
+        uint256 supplyAndVirtual = totalSupply() + VIRTUAL_SHARES; // round up, favors pool
         return (shares * (totalAssets() + VIRTUAL_ASSETS) + supplyAndVirtual - 1) / supplyAndVirtual;
     }
 
     function previewWithdraw(uint256 assets) public view returns (uint256) {
-        // Round UP (favors pool)
-        uint256 totalAndVirtual = totalAssets() + VIRTUAL_ASSETS;
+        uint256 totalAndVirtual = totalAssets() + VIRTUAL_ASSETS; // round up, favors pool
         return (assets * (totalSupply() + VIRTUAL_SHARES) + totalAndVirtual - 1) / totalAndVirtual;
     }
 
@@ -502,8 +404,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         return sharesToAssets(shares);
     }
 
-    // ── Admin Functions ─────────────────────────────────────────────────
-
     function setTeeOperator(address _teeOperator) external onlyOwner {
         if (_teeOperator == address(0)) revert ZeroAddress();
         emit TeeOperatorUpdated(teeOperator, _teeOperator);
@@ -518,9 +418,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         _setRateParams(_baseRateBps, _kinkUtilizationBps, _kinkRateBps, _maxRateBps);
     }
 
-    /// @dev Validate, accrue, apply and emit the rate-model update. Access control lives in the
-    ///      external `setRateParams` (onlyOwner here); a subclass may expose it under a different
-    ///      gate (e.g. a delegated rate admin) by overriding that external function and calling this.
+    // internal so a subclass can gate the external entrypoint differently (e.g. a rate admin).
     function _setRateParams(
         uint256 _baseRateBps,
         uint256 _kinkUtilizationBps,
@@ -542,9 +440,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         status = _status;
     }
 
-    /// @notice Toggle the borrower-wallet allowlist. When enabled, borrow() reverts unless
-    ///         the target wallet is in `allowedBorrowerWallet`. Manage the list with a colder
-    ///         key than the teeOperator for the allowlist to constrain a hot-key compromise.
     function setBorrowAllowlistEnabled(bool enabled) external onlyOwner {
         borrowAllowlistEnabled = enabled;
         emit BorrowAllowlistEnabledUpdated(enabled);
@@ -556,7 +451,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit AllowedBorrowerWalletUpdated(wallet, allowed);
     }
 
-    /// @notice Batch variant of setAllowedBorrowerWallet, set the same `allowed` flag for many wallets.
     function setAllowedBorrowerWallets(address[] calldata wallets, bool allowed) external onlyOwner {
         uint256 len = wallets.length;
         for (uint256 i; i < len; ++i) {
@@ -566,10 +460,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         }
     }
 
-    /// @notice Set the borrow circuit breakers. `_maxBorrowPerLoan` caps a single borrow;
-    ///         `_maxBorrowPerWindow` caps cumulative borrows inside a rolling `_borrowWindow`
-    ///         (seconds). Any of the caps set to 0 disables that check. Resets the running
-    ///         window. Reverts if a window cap is set without a positive window length.
+    /// @notice Any cap set to 0 disables that check. Reverts if a window cap is set with no window.
     function setBorrowCaps(uint256 _maxBorrowPerLoan, uint256 _maxBorrowPerWindow, uint256 _borrowWindow)
         external
         onlyOwner
@@ -583,29 +474,23 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit BorrowCapsUpdated(_maxBorrowPerLoan, _maxBorrowPerWindow, _borrowWindow);
     }
 
-    /// @notice Set the protocol fee taken from interest on fully repaid loans. 0 disables it.
-    ///         Capped at MAX_FEE_BPS. Does not touch already-accrued fees.
     function setProtocolFee(uint256 _feeBps) external onlyOwner {
         _setProtocolFee(_feeBps);
     }
 
-    /// @dev Validate and set the fee. Internal so a subclass can wire it in the constructor
-    ///      (where onlyOwner would revert), matching how rate params are set at construction.
+    // internal so a subclass can set the fee in its constructor (where onlyOwner would revert).
     function _setProtocolFee(uint256 _feeBps) internal {
         if (_feeBps > MAX_FEE_BPS) revert InvalidFeeParams();
         feeBps = _feeBps;
         emit ProtocolFeeUpdated(_feeBps);
     }
 
-    /// @notice Set the address allowed to collect accrued fees (in addition to the owner).
-    ///         address(0) means only the owner can collect.
+    /// @notice address(0) means only the owner can collect.
     function setFeeRecipient(address _feeRecipient) external onlyOwner {
         emit FeeRecipientUpdated(feeRecipient, _feeRecipient);
         feeRecipient = _feeRecipient;
     }
 
-    /// @notice Transfer `amount` of accrued protocol fees to `to`. Callable by the owner or the
-    ///         feeRecipient. The fee USDC is already held by this pool (reserved at repay()).
     function collectProtocolFees(address to, uint256 amount) external nonReentrant {
         if (msg.sender != owner() && msg.sender != feeRecipient) revert OnlyOwnerOrFeeRecipient();
         if (to == address(0)) revert ZeroAddress();
@@ -616,12 +501,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit ProtocolFeesCollected(to, amount);
     }
 
-    // ── Internal ────────────────────────────────────────────────────────
-
-    /// @dev Enforce the OWNER-configured borrow controls (allowlist + per-loan cap + rolling
-    ///      window cap). All checks are no-ops until an owner sets them. On the window cap this
-    ///      advances the tumbling window and accumulates `windowBorrowed`; a later revert in
-    ///      borrow() rolls that back with the rest of the tx.
     function _enforceBorrowControls(address wallet, uint256 amount) internal {
         if (borrowAllowlistEnabled && !allowedBorrowerWallet[wallet]) revert WalletNotAllowed();
         if (maxBorrowPerLoan != 0 && amount > maxBorrowPerLoan) revert BorrowCapExceeded();
@@ -635,15 +514,15 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         }
     }
 
-    /// @dev Convert borrow assets to shares. Rounds UP (favors protocol on borrow).
+    // rounds up, favors the protocol
     function _borrowSharesToMint(uint256 assets) internal view returns (uint256) {
         if (totalBorrowShares == 0 || totalBorrowAssets == 0) {
-            return assets; // 1:1 when pool is empty
+            return assets;
         }
         return (assets * totalBorrowShares + totalBorrowAssets - 1) / totalBorrowAssets;
     }
 
-    /// @dev Convert borrow shares to assets (debt). Rounds UP (favors protocol on repay).
+    // rounds up, favors the protocol
     function _borrowAssetsOwed(uint256 shares) internal view returns (uint256) {
         if (totalBorrowShares == 0) return 0;
         return (shares * totalBorrowAssets + totalBorrowShares - 1) / totalBorrowShares;
@@ -667,12 +546,10 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     function _borrowRateAtUtilization(uint256 util) internal view returns (uint256) {
         if (util <= kinkUtilizationBps) {
-            // Below kink: linear from baseRate to kinkRate
             if (kinkUtilizationBps == 0) return baseRateBps;
             return baseRateBps + ((kinkRateBps - baseRateBps) * util) / kinkUtilizationBps;
         }
 
-        // Above kink: linear from kinkRate to maxRate
         uint256 excessUtil = util - kinkUtilizationBps;
         uint256 excessRange = BPS - kinkUtilizationBps;
         if (excessRange == 0) return maxRateBps;
