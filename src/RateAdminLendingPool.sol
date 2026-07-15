@@ -25,10 +25,17 @@ contract RateAdminLendingPool is AmplifiLendingPool {
         uint256 _kinkUtilizationBps,
         uint256 _kinkRateBps,
         uint256 _maxRateBps,
-        address _rateAdmin
+        address _rateAdmin,
+        uint256 _feeBps,
+        address _feeRecipient
     ) AmplifiLendingPool(_usdc, _owner, _teeOperator, _baseRateBps, _kinkUtilizationBps, _kinkRateBps, _maxRateBps) {
         // _rateAdmin == address(0) is allowed: the role starts unset and can be assigned later.
         rateAdmin = _rateAdmin;
+        // Fee params are set here (not post-deploy) because the owner is a colder key than the
+        // deployer, so the owner-gated setters may not be callable right after deploy.
+        _setProtocolFee(_feeBps);
+        feeRecipient = _feeRecipient;
+        if (_feeRecipient != address(0)) emit FeeRecipientUpdated(address(0), _feeRecipient);
     }
 
     /// @notice Appoint, rotate, or revoke the rate admin. address(0) revokes the role; the owner

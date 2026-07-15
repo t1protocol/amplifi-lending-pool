@@ -37,6 +37,19 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     // pool<->deposit-wallet directly, no commingling, and each loan's borrower is
     // recorded on-chain and gates who may repay it.
     mapping(uint256 loanId => address wallet) public loanWallet;
+    // Original principal borrowed per loan, recorded at borrow() and used at repay() to
+    // split the settled interest (debt - principal) between lenders and the protocol fee.
+    mapping(uint256 loanId => uint256 principal) public loanPrincipal;
+
+    // ── Protocol fee ────────────────────────────────────────────────────
+    // Optional owner-set fee taken from the interest on FULLY repaid loans (no bad debt).
+    // Off by default (feeBps = 0, behaviour-neutral). At repay(), fee = interest * feeBps / BPS
+    // is reserved into protocolFeesAccrued (denominated in the underlying asset) and carved out
+    // of totalAssets()/availableLiquidity() so it is neither lender NAV nor lendable liquidity.
+    // Lenders keep the remaining interest exactly as before. feeRecipient (or the owner) collects.
+    uint256 public feeBps;
+    address public feeRecipient;
+    uint256 public protocolFeesAccrued;
 
     // ── Interest Rate Model ─────────────────────────────────────────────
     uint256 public baseRateBps;
@@ -79,6 +92,8 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     // where an owner with one share inflates totalBorrowAssets, rounds withdraw share
     // cost down to 1, and burns 1 share for the whole pool.
     uint256 public constant MAX_RATE_CAP_BPS = 1_000_000;
+    // Hard ceiling on the protocol fee (50%). Bounds how much of loan interest an owner can divert.
+    uint256 public constant MAX_FEE_BPS = 5_000;
     // Virtual offset to mitigate ERC-4626 first-depositor inflation attack.
     // See: https://docs.openzeppelin.com/contracts/5.x/erc4626#defending_with_a_virtual_offset
     uint256 private constant VIRTUAL_SHARES = 1e3;
@@ -96,6 +111,10 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     event BorrowAllowlistEnabledUpdated(bool enabled);
     event AllowedBorrowerWalletUpdated(address indexed wallet, bool allowed);
     event BorrowCapsUpdated(uint256 maxBorrowPerLoan, uint256 maxBorrowPerWindow, uint256 borrowWindow);
+    event ProtocolFeeUpdated(uint256 feeBps);
+    event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
+    event ProtocolFeeAccrued(uint256 indexed loanId, uint256 interest, uint256 fee);
+    event ProtocolFeesCollected(address indexed to, uint256 amount);
 
     // ── Errors ──────────────────────────────────────────────────────────
     error OnlyTeeOperator();
@@ -112,6 +131,9 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     error WalletNotAllowed();
     error BorrowCapExceeded();
     error InvalidBorrowCaps();
+    error InvalidFeeParams();
+    error OnlyOwnerOrFeeRecipient();
+    error FeeExceedsAccrued();
 
     // ── Modifiers ───────────────────────────────────────────────────────
     modifier onlyTeeOperator() {
@@ -290,6 +312,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         uint256 shares = _borrowSharesToMint(amount);
         loanShares[loanId] = shares;
         loanWallet[loanId] = wallet;
+        loanPrincipal[loanId] = amount;
         totalBorrowShares += shares;
         totalBorrowAssets += amount;
 
@@ -332,9 +355,11 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         uint256 debt = _borrowAssetsOwed(shares);
         uint256 repaid = debt < amount ? debt : amount;
         uint256 badDebt = debt - repaid;
+        uint256 principal = loanPrincipal[loanId];
 
         delete loanShares[loanId];
         delete loanWallet[loanId];
+        delete loanPrincipal[loanId];
         totalBorrowShares -= shares;
         totalBorrowAssets -= debt;
 
@@ -345,6 +370,16 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         if (badDebt > 0) {
             totalBadDebtRealized += badDebt;
             emit BadDebtRealized(loanId, badDebt);
+        } else if (feeBps > 0) {
+            // Loan repaid in full: take feeBps of the settled interest for the protocol. The
+            // pushed repayment (>= debt) is already in this pool's balance, so reserving the fee
+            // is pure accounting: it stays as pool liquidity until collectProtocolFees().
+            uint256 interest = debt > principal ? debt - principal : 0;
+            uint256 fee = (interest * feeBps) / BPS;
+            if (fee > 0) {
+                protocolFeesAccrued += fee;
+                emit ProtocolFeeAccrued(loanId, interest, fee);
+            }
         }
     }
 
@@ -385,11 +420,16 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     }
 
     function totalAssets() public view returns (uint256) {
-        return usdc.balanceOf(address(this)) + totalBorrowAssets + _pendingInterest();
+        uint256 gross = usdc.balanceOf(address(this)) + totalBorrowAssets + _pendingInterest();
+        // Reserved protocol fees are not lender NAV. Saturating subtraction as a defensive
+        // guard against underflow (the invariant balance >= protocolFeesAccrued always holds).
+        return gross > protocolFeesAccrued ? gross - protocolFeesAccrued : 0;
     }
 
     function availableLiquidity() public view returns (uint256) {
-        return usdc.balanceOf(address(this));
+        uint256 bal = usdc.balanceOf(address(this));
+        // Reserved protocol fees are earmarked, so not borrowable or withdrawable by lenders.
+        return bal > protocolFeesAccrued ? bal - protocolFeesAccrued : 0;
     }
 
     function utilization() public view returns (uint256) {
@@ -541,6 +581,39 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         windowStart = block.timestamp;
         windowBorrowed = 0;
         emit BorrowCapsUpdated(_maxBorrowPerLoan, _maxBorrowPerWindow, _borrowWindow);
+    }
+
+    /// @notice Set the protocol fee taken from interest on fully repaid loans. 0 disables it.
+    ///         Capped at MAX_FEE_BPS. Does not touch already-accrued fees.
+    function setProtocolFee(uint256 _feeBps) external onlyOwner {
+        _setProtocolFee(_feeBps);
+    }
+
+    /// @dev Validate and set the fee. Internal so a subclass can wire it in the constructor
+    ///      (where onlyOwner would revert), matching how rate params are set at construction.
+    function _setProtocolFee(uint256 _feeBps) internal {
+        if (_feeBps > MAX_FEE_BPS) revert InvalidFeeParams();
+        feeBps = _feeBps;
+        emit ProtocolFeeUpdated(_feeBps);
+    }
+
+    /// @notice Set the address allowed to collect accrued fees (in addition to the owner).
+    ///         address(0) means only the owner can collect.
+    function setFeeRecipient(address _feeRecipient) external onlyOwner {
+        emit FeeRecipientUpdated(feeRecipient, _feeRecipient);
+        feeRecipient = _feeRecipient;
+    }
+
+    /// @notice Transfer `amount` of accrued protocol fees to `to`. Callable by the owner or the
+    ///         feeRecipient. The fee USDC is already held by this pool (reserved at repay()).
+    function collectProtocolFees(address to, uint256 amount) external nonReentrant {
+        if (msg.sender != owner() && msg.sender != feeRecipient) revert OnlyOwnerOrFeeRecipient();
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        if (amount > protocolFeesAccrued) revert FeeExceedsAccrued();
+        protocolFeesAccrued -= amount;
+        usdc.safeTransfer(to, amount);
+        emit ProtocolFeesCollected(to, amount);
     }
 
     // ── Internal ────────────────────────────────────────────────────────

@@ -17,6 +17,9 @@ contract DeployRateAdmin is Script {
     uint256 constant DEFAULT_KINK_RATE_BPS = 20_000;
     uint256 constant DEFAULT_MAX_RATE_BPS = 100_000;
 
+    // Protocol fee: 10% of interest on fully repaid loans.
+    uint256 constant DEFAULT_FEE_BPS = 1_000;
+
     function run() external {
         address underlying = vm.envOr("UNDERLYING_ADDRESS", DEFAULT_UNDERLYING);
         address owner = vm.envAddress("OWNER_ADDRESS");
@@ -29,6 +32,10 @@ contract DeployRateAdmin is Script {
         uint256 kinkRateBps = vm.envOr("KINK_RATE_BPS", DEFAULT_KINK_RATE_BPS);
         uint256 maxRateBps = vm.envOr("MAX_RATE_BPS", DEFAULT_MAX_RATE_BPS);
 
+        uint256 feeBps = vm.envOr("FEE_BPS", DEFAULT_FEE_BPS);
+        // Optional: address(0) means only the owner can collect fees; set a treasury later.
+        address feeRecipient = vm.envOr("FEE_RECIPIENT", address(0));
+
         console2.log("=== RateAdminLendingPool deploy ===");
         console2.log("Underlying:        ", underlying);
         console2.log("Owner:             ", owner);
@@ -38,13 +45,27 @@ contract DeployRateAdmin is Script {
         console2.log("Kink util bps:     ", kinkUtilizationBps);
         console2.log("Kink rate bps:     ", kinkRateBps);
         console2.log("Max rate bps:      ", maxRateBps);
+        console2.log("Fee bps:           ", feeBps);
+        console2.log("Fee recipient:     ", feeRecipient);
         if (rateAdmin == address(0)) {
             console2.log("NOTE: rate admin is UNSET; assign it post-deploy with setRateAdmin().");
+        }
+        if (feeRecipient == address(0)) {
+            console2.log("NOTE: fee recipient is UNSET; only the owner can collect fees.");
         }
 
         vm.startBroadcast();
         RateAdminLendingPool pool = new RateAdminLendingPool(
-            underlying, owner, teeOperator, baseRateBps, kinkUtilizationBps, kinkRateBps, maxRateBps, rateAdmin
+            underlying,
+            owner,
+            teeOperator,
+            baseRateBps,
+            kinkUtilizationBps,
+            kinkRateBps,
+            maxRateBps,
+            rateAdmin,
+            feeBps,
+            feeRecipient
         );
         vm.stopBroadcast();
 
