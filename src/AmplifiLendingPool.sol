@@ -37,6 +37,12 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     // pool<->deposit-wallet directly, no commingling, and each loan's borrower is
     // recorded on-chain and gates who may repay it.
     mapping(uint256 loanId => address wallet) public loanWallet;
+    mapping(uint256 loanId => uint256 principal) public loanPrincipal;
+
+    // ── Protocol fee ────────────────────────────────────────────────────
+    uint256 public feeBps;
+    address public feeRecipient;
+    uint256 public protocolFeesAccrued;
 
     // ── Interest Rate Model ─────────────────────────────────────────────
     uint256 public baseRateBps;
@@ -79,6 +85,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     // where an owner with one share inflates totalBorrowAssets, rounds withdraw share
     // cost down to 1, and burns 1 share for the whole pool.
     uint256 public constant MAX_RATE_CAP_BPS = 1_000_000;
+    uint256 public constant MAX_FEE_BPS = 5_000;
     // Virtual offset to mitigate ERC-4626 first-depositor inflation attack.
     // See: https://docs.openzeppelin.com/contracts/5.x/erc4626#defending_with_a_virtual_offset
     uint256 private constant VIRTUAL_SHARES = 1e3;
@@ -96,6 +103,10 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     event BorrowAllowlistEnabledUpdated(bool enabled);
     event AllowedBorrowerWalletUpdated(address indexed wallet, bool allowed);
     event BorrowCapsUpdated(uint256 maxBorrowPerLoan, uint256 maxBorrowPerWindow, uint256 borrowWindow);
+    event ProtocolFeeUpdated(uint256 feeBps);
+    event FeeRecipientUpdated(address indexed oldRecipient, address indexed newRecipient);
+    event ProtocolFeeAccrued(uint256 indexed loanId, uint256 interest, uint256 fee);
+    event ProtocolFeesCollected(address indexed to, uint256 amount);
 
     // ── Errors ──────────────────────────────────────────────────────────
     error OnlyTeeOperator();
@@ -112,6 +123,9 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     error WalletNotAllowed();
     error BorrowCapExceeded();
     error InvalidBorrowCaps();
+    error InvalidFeeParams();
+    error OnlyOwnerOrFeeRecipient();
+    error FeeExceedsAccrued();
 
     // ── Modifiers ───────────────────────────────────────────────────────
     modifier onlyTeeOperator() {
@@ -290,6 +304,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         uint256 shares = _borrowSharesToMint(amount);
         loanShares[loanId] = shares;
         loanWallet[loanId] = wallet;
+        loanPrincipal[loanId] = amount;
         totalBorrowShares += shares;
         totalBorrowAssets += amount;
 
@@ -332,9 +347,11 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         uint256 debt = _borrowAssetsOwed(shares);
         uint256 repaid = debt < amount ? debt : amount;
         uint256 badDebt = debt - repaid;
+        uint256 principal = loanPrincipal[loanId];
 
         delete loanShares[loanId];
         delete loanWallet[loanId];
+        delete loanPrincipal[loanId];
         totalBorrowShares -= shares;
         totalBorrowAssets -= debt;
 
@@ -345,6 +362,13 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         if (badDebt > 0) {
             totalBadDebtRealized += badDebt;
             emit BadDebtRealized(loanId, badDebt);
+        } else if (feeBps > 0) {
+            uint256 interest = debt > principal ? debt - principal : 0;
+            uint256 fee = (interest * feeBps) / BPS;
+            if (fee > 0) {
+                protocolFeesAccrued += fee;
+                emit ProtocolFeeAccrued(loanId, interest, fee);
+            }
         }
     }
 
@@ -385,11 +409,13 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     }
 
     function totalAssets() public view returns (uint256) {
-        return usdc.balanceOf(address(this)) + totalBorrowAssets + _pendingInterest();
+        uint256 gross = usdc.balanceOf(address(this)) + totalBorrowAssets + _pendingInterest();
+        return gross > protocolFeesAccrued ? gross - protocolFeesAccrued : 0;
     }
 
     function availableLiquidity() public view returns (uint256) {
-        return usdc.balanceOf(address(this));
+        uint256 bal = usdc.balanceOf(address(this));
+        return bal > protocolFeesAccrued ? bal - protocolFeesAccrued : 0;
     }
 
     function utilization() public view returns (uint256) {
@@ -478,9 +504,6 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         _setRateParams(_baseRateBps, _kinkUtilizationBps, _kinkRateBps, _maxRateBps);
     }
 
-    /// @dev Validate, accrue, apply and emit the rate-model update. Access control lives in the
-    ///      external `setRateParams` (onlyOwner here); a subclass may expose it under a different
-    ///      gate (e.g. a delegated rate admin) by overriding that external function and calling this.
     function _setRateParams(
         uint256 _baseRateBps,
         uint256 _kinkUtilizationBps,
@@ -541,6 +564,31 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         windowStart = block.timestamp;
         windowBorrowed = 0;
         emit BorrowCapsUpdated(_maxBorrowPerLoan, _maxBorrowPerWindow, _borrowWindow);
+    }
+
+    function setProtocolFee(uint256 _feeBps) external onlyOwner {
+        _setProtocolFee(_feeBps);
+    }
+
+    function _setProtocolFee(uint256 _feeBps) internal {
+        if (_feeBps > MAX_FEE_BPS) revert InvalidFeeParams();
+        feeBps = _feeBps;
+        emit ProtocolFeeUpdated(_feeBps);
+    }
+
+    function setFeeRecipient(address _feeRecipient) external onlyOwner {
+        emit FeeRecipientUpdated(feeRecipient, _feeRecipient);
+        feeRecipient = _feeRecipient;
+    }
+
+    function collectProtocolFees(address to, uint256 amount) external nonReentrant {
+        if (msg.sender != owner() && msg.sender != feeRecipient) revert OnlyOwnerOrFeeRecipient();
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        if (amount > protocolFeesAccrued) revert FeeExceedsAccrued();
+        protocolFeesAccrued -= amount;
+        usdc.safeTransfer(to, amount);
+        emit ProtocolFeesCollected(to, amount);
     }
 
     // ── Internal ────────────────────────────────────────────────────────

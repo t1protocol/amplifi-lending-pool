@@ -33,7 +33,7 @@ contract RateAdminLendingPoolTest is Test {
     function setUp() public {
         usdc = new MockUSDC();
         pool = new RateAdminLendingPool(
-            address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, rateAdmin
+            address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, rateAdmin, 0, address(0)
         );
     }
 
@@ -52,9 +52,25 @@ contract RateAdminLendingPoolTest is Test {
 
     function test_constructor_zeroRateAdmin_allowed() public {
         RateAdminLendingPool p = new RateAdminLendingPool(
-            address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, address(0)
+            address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, address(0), 0, address(0)
         );
         assertEq(p.rateAdmin(), address(0));
+    }
+
+    function test_constructor_setsFeeParams() public {
+        address treasury = makeAddr("treasury");
+        RateAdminLendingPool p = new RateAdminLendingPool(
+            address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, rateAdmin, 1000, treasury
+        );
+        assertEq(p.feeBps(), 1000);
+        assertEq(p.feeRecipient(), treasury);
+    }
+
+    function test_constructor_feeAboveCapReverts() public {
+        vm.expectRevert(AmplifiLendingPool.InvalidFeeParams.selector);
+        new RateAdminLendingPool(
+            address(usdc), owner, teeOperator, BASE_RATE, KINK_UTIL, KINK_RATE, MAX_RATE, rateAdmin, 5001, address(0)
+        );
     }
 
     // ── setRateParams access ────────────────────────────────────────────────
