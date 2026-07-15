@@ -34,7 +34,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     // Per-loan borrower wallet. borrow() disburses the principal here, and repay()
     // is called BY this wallet after it has pushed the repayment to the pool (see
     // repay()). Replaces the single global fundAccount so funds flow
-    // pool<->deposit-wallet directly — no commingling, and each loan's borrower is
+    // pool<->deposit-wallet directly, no commingling, and each loan's borrower is
     // recorded on-chain and gates who may repay it.
     mapping(uint256 loanId => address wallet) public loanWallet;
 
@@ -52,7 +52,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     // 0 / false), so existing behaviour is preserved.
 
     // Optional borrower-wallet allowlist. When enabled, borrow() only disburses to
-    // pre-approved wallets — fully restoring the "operator cannot divert funds to an
+    // pre-approved wallets, fully restoring the "operator cannot divert funds to an
     // arbitrary address" invariant, PROVIDED the owner (who manages the list) is a
     // colder key than the hot teeOperator. Off by default (behaviour-neutral).
     bool public borrowAllowlistEnabled;
@@ -68,7 +68,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     uint256 public windowStart;
     uint256 public windowBorrowed;
 
-    // Cumulative bad debt realized across all loans — a cheap on-chain counter for
+    // Cumulative bad debt realized across all loans, a cheap on-chain counter for
     // monitoring/alerting on write-offs (the per-loan BadDebtRealized event still fires).
     uint256 public totalBadDebtRealized;
 
@@ -199,7 +199,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     // lender funds and outstanding loans (audit #1, #6).
 
     /// @notice Redeem by SHARES. Burns `shares` from msg.sender and sends the corresponding
-    ///         assets to msg.sender. WARNING: this overload takes SHARES, NOT assets — it is
+    ///         assets to msg.sender. WARNING: this overload takes SHARES, NOT assets, it is
     ///         NOT the ERC-4626 `withdraw(assets,...)`. To withdraw a specific ASSET amount use
     ///         `withdrawAssets(assets)` or the 3-arg `withdraw(assets, receiver, owner)`.
     function withdraw(uint256 shares) external nonReentrant returns (uint256 assets) {
@@ -299,24 +299,24 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
     }
 
     /// @notice Repay a loan. PUSH-based: the loan's borrower wallet transfers the
-    ///         repayment pUSD to this pool and then calls repay — both in the SAME
+    ///         repayment pUSD to this pool and then calls repay, both in the SAME
     ///         atomic transaction (a Polymarket relayer WALLET batch). Nothing is
     ///         pulled here: a `transferFrom` would need the wallet to `approve` this
     ///         pool, and Polymarket's relayer permanently blocks a deposit wallet
     ///         approving any non-Polymarket spender (drain protection), so the pull
     ///         model is impossible. The pushed pUSD is already in this pool's
-    ///         balance — and therefore already in availableLiquidity()/totalAssets(),
-    ///         since idle liquidity is measured by balanceOf — so accounting stays
+    ///         balance, and therefore already in availableLiquidity()/totalAssets(),
+    ///         since idle liquidity is measured by balanceOf, so accounting stays
     ///         exactly as before; repay only settles the loan bookkeeping.
     /// @dev Gated to the loan's own wallet (`loanWallet[loanId]`), which is an
-    ///      amplifi-server-controlled deposit wallet — no external party can call it.
+    ///      amplifi-server-controlled deposit wallet, no external party can call it.
     ///      This is the same trust boundary as the previous `onlyTeeOperator` gate:
     ///      the caller is trusted to have pushed `amount` pUSD in the same batch, just
     ///      as the operator was trusted to have set an approval. A relayer batch is
     ///      all-or-nothing (it reverts as a unit if any call, incl. the transfer,
     ///      would fail), so repay cannot execute without its paired push.
     /// @param amount The pUSD the wallet pushed for this repayment. The loan is
-    ///        credited min(amount, debt); a shortfall (amount < debt — e.g. an
+    ///        credited min(amount, debt); a shortfall (amount < debt, e.g. an
     ///        under-collateralized liquidation) is written off as bad debt absorbed
     ///        by lenders via reduced share price. Callers push exactly what they
     ///        intend to credit (full debt, or the recovered proceeds on a
@@ -338,7 +338,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         totalBorrowShares -= shares;
         totalBorrowAssets -= debt;
 
-        // No transferFrom — the wallet pushed the repayment to this pool in the same
+        // No transferFrom, the wallet pushed the repayment to this pool in the same
         // atomic batch immediately before calling repay (see @notice).
 
         emit Repay(loanId, wallet, repaid, shares);
@@ -472,8 +472,21 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
 
     function setRateParams(uint256 _baseRateBps, uint256 _kinkUtilizationBps, uint256 _kinkRateBps, uint256 _maxRateBps)
         external
+        virtual
         onlyOwner
     {
+        _setRateParams(_baseRateBps, _kinkUtilizationBps, _kinkRateBps, _maxRateBps);
+    }
+
+    /// @dev Validate, accrue, apply and emit the rate-model update. Access control lives in the
+    ///      external `setRateParams` (onlyOwner here); a subclass may expose it under a different
+    ///      gate (e.g. a delegated rate admin) by overriding that external function and calling this.
+    function _setRateParams(
+        uint256 _baseRateBps,
+        uint256 _kinkUtilizationBps,
+        uint256 _kinkRateBps,
+        uint256 _maxRateBps
+    ) internal virtual {
         _validateRateParams(_baseRateBps, _kinkUtilizationBps, _kinkRateBps, _maxRateBps);
         accrueInterest();
         baseRateBps = _baseRateBps;
@@ -503,7 +516,7 @@ contract AmplifiLendingPool is ERC20, IERC4626, ReentrancyGuard, Ownable2Step {
         emit AllowedBorrowerWalletUpdated(wallet, allowed);
     }
 
-    /// @notice Batch variant of setAllowedBorrowerWallet — set the same `allowed` flag for many wallets.
+    /// @notice Batch variant of setAllowedBorrowerWallet, set the same `allowed` flag for many wallets.
     function setAllowedBorrowerWallets(address[] calldata wallets, bool allowed) external onlyOwner {
         uint256 len = wallets.length;
         for (uint256 i; i < len; ++i) {
